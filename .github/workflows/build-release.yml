@@ -39,38 +39,6 @@ jobs:
           name: macos-arm
           path: VideomancerControl_macOS_ARM.zip
 
-  build-macos-intel:
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: pip install PyQt6 pyserial pyinstaller
-
-      - name: Build binary
-        run: |
-          pyinstaller --onefile --windowed \
-            --name "VideomancerControl" \
-            --icon "icon.icns" \
-            --hidden-import serial.tools.list_ports \
-            --collect-submodules PyQt6 \
-            main.py
-
-      - name: Create zip
-        run: |
-          cd dist
-          zip -r ../VideomancerControl_macOS_Intel.zip "VideomancerControl.app"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-intel
-          path: VideomancerControl_macOS_Intel.zip
 
   build-windows:
     runs-on: windows-latest
@@ -100,22 +68,17 @@ jobs:
           path: VideomancerControl_Windows.zip
 
   release:
-    needs: [build-macos-arm, build-macos-intel, build-windows]
+    needs: [build-macos-arm, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download macOS ARM artifact
+      - name: Download macOS artifact
         uses: actions/download-artifact@v4
         with:
           name: macos-arm
-
-      - name: Download macOS Intel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-intel
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
@@ -132,11 +95,8 @@ jobs:
             Desktop companion app for the LZX Industries Videomancer.
 
             ### Downloads
-            | Platform | File | Chip |
-            |----------|------|------|
-            | **macOS** | `VideomancerControl_macOS_ARM.zip` | Apple Silicon (M1/M2/M3/M4) |
-            | **macOS** | `VideomancerControl_macOS_Intel.zip` | Intel |
-            | **Windows** | `VideomancerControl_Windows.zip` | x64 |
+            - **macOS**: `VideomancerControl_macOS_ARM.zip` — Apple Silicon (M1/M2/M3/M4). Intel Macs can run via Rosetta.
+            - **Windows**: `VideomancerControl_Windows.zip`
 
             First launch on macOS: System Settings > Privacy & Security > Open Anyway
 
@@ -150,7 +110,6 @@ jobs:
             ```
           files: |
             VideomancerControl_macOS_ARM.zip
-            VideomancerControl_macOS_Intel.zip
             VideomancerControl_Windows.zip
           draft: false
           prerelease: true
