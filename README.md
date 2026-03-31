@@ -1,6 +1,6 @@
 # Videomancer Control
 ### Desktop companion app for LZX Industries Videomancer
-**LZX Industries x Videowaste**
+**LZX Industries x Videowaste x Claude**
 
 ---
 
