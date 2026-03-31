@@ -90,13 +90,17 @@ jobs:
         with:
           name: Videomancer Control ${{ github.ref_name }}
           body: |
-            ## Videomancer Control ${{ github.ref_name }}
+            ## Videomancer Control ${{ github.ref_name }} (Pre-Release)
 
             Desktop companion app for the LZX Industries Videomancer.
 
             ### Downloads
             - **macOS**: `VideomancerControl_macOS.zip` — extract and run. First launch: System Settings > Privacy & Security > Open Anyway
             - **Windows**: `VideomancerControl_Windows.zip` — extract and run the .exe
+
+            ### Known Issues
+            - TSS (Time/Space/Slope) knob UI response is under development — commands send to device but visual feedback may not reflect changes
+            - Some controls may require firmware RC12+ for full functionality
 
             ### Run from source
             ```

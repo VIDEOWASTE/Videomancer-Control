@@ -46,7 +46,7 @@ The app auto-connects whenever you plug in your Videomancer. No manual port conf
 - **Program Browser** — search, browse, and load FPGA programs
 - **12-Channel Parameter Control** — custom knobs, faders, and toggles with real-time sync
 - **LFO Modulation** — assign modulators (Free LFO, Sync LFO, Random, Envelope, Step Seq, and 30+ more) with live waveform visualization
-- **Time/Space/Slope Controls** — per-channel TSS adjustment for each modulator
+- **Time/Space/Slope Controls** — per-channel TSS adjustment for each modulator *(UI feedback in progress)*
 - **Transport** — tap tempo, BPM control, play/stop with hardware sync
 - **Presets** — factory and user preset management
 - **Snapshots** — save/restore full device state as local JSON files
