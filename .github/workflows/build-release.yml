@@ -107,4 +107,4 @@ jobs:
             VideomancerControl_macOS.zip
             VideomancerControl_Windows.zip
           draft: false
-          prerelease: false
+          prerelease: true
