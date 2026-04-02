@@ -1,5 +1,5 @@
 """
-main.py  —  Videomancer Control  v0.3
+main.py  —  Videomancer Control
 Full companion app for the LZX Industries Videomancer.
 
 Tabs:
@@ -12,6 +12,9 @@ Run:
     pip3 install PyQt6 pyserial
     python3 main.py
 """
+
+APP_VERSION = "1.1"
+GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
 import json
@@ -39,6 +42,53 @@ except ImportError:
     HAS_SERIAL = False
 
 from serial_worker import SerialWorker
+
+
+# ── Update checker ────────────────────────────────────────────────────
+
+class _UpdateChecker(QThread):
+    """Background thread that checks GitHub releases for a newer version."""
+    from PyQt6.QtCore import pyqtSignal
+    update_available = pyqtSignal(str, str)  # (new_version, download_url)
+
+    def run(self):
+        try:
+            from urllib.request import urlopen, Request
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = Request(url, headers={"Accept": "application/vnd.github+json",
+                                        "User-Agent": "VideomancerControl"})
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "")
+            remote_ver = tag.lstrip("v")
+            local_ver = APP_VERSION.lstrip("v")
+            if self._is_newer(remote_ver, local_ver):
+                html_url = data.get("html_url", "")
+                self.update_available.emit(remote_ver, html_url)
+        except Exception:
+            pass  # Network errors are non-fatal
+
+    @staticmethod
+    def _is_newer(remote: str, local: str) -> bool:
+        """Compare version strings like '1.0.1' > '1.0.0-rc1'."""
+        def parse(v):
+            # Split on '-' to separate pre-release
+            parts = v.split("-", 1)
+            nums = [int(x) for x in re.findall(r"\d+", parts[0])]
+            # Pre-release (rc, beta, alpha) sorts before release
+            is_pre = len(parts) > 1
+            return (nums, 0 if is_pre else 1, parts[1] if is_pre else "")
+        try:
+            r = parse(remote)
+            l = parse(local)
+            return r > l
+        except Exception:
+            return False
+
+
+# ── Multi-device: global registry of ports claimed by open windows ────
+_claimed_ports: set = set()
+_app_windows: list = []      # all open VideomancerApp windows
 
 
 # ── Design tokens — dark purple/violet, high contrast ─────────────────
@@ -312,11 +362,16 @@ class ConnectionBar(QWidget):
             for d in ["/dev/tty.usbmodem101", "/dev/ttyACM0", "COM3"]:
                 self.port_combo.addItem(d)
 
-    def find_videomancer_port(self) -> Optional[str]:
-        """Scan ports for a Videomancer device by USB VID/PID or name."""
+    def find_videomancer_port(self, exclude: set = None) -> Optional[str]:
+        """Scan ports for a Videomancer device by USB VID/PID or name.
+        Skips ports in *exclude* (used to avoid claiming a port already
+        owned by another window)."""
         if not HAS_SERIAL:
             return None
+        skip = exclude or set()
         for p in list_ports.comports():
+            if p.device in skip:
+                continue
             desc = (p.description or "").lower()
             mfr  = (p.manufacturer or "").lower()
             name = (p.device or "").lower()
@@ -337,9 +392,34 @@ class ConnectionBar(QWidget):
                 return p.device
         return None
 
+    @staticmethod
+    def find_all_videomancer_ports() -> List[str]:
+        """Return all serial ports that look like a Videomancer device."""
+        if not HAS_SERIAL:
+            return []
+        ports = []
+        for p in list_ports.comports():
+            desc = (p.description or "").lower()
+            mfr  = (p.manufacturer or "").lower()
+            name = (p.device or "").lower()
+            vid  = getattr(p, 'vid', None)
+            match = False
+            if vid == 0x2E8A:
+                match = True
+            elif any(k in desc or k in mfr for k in
+                     ["videomancer", "lzx", "pico", "rp2040", "usbmodem"]):
+                match = True
+            elif "usbmodem" in name and name.startswith("/dev/cu."):
+                match = True
+            elif "usb serial" in desc or "usb serial" in mfr:
+                match = True
+            if match:
+                ports.append(p.device)
+        return ports
+
     def try_auto_connect(self):
         """Try to find and connect to a Videomancer automatically."""
-        port = self.find_videomancer_port()
+        port = self.find_videomancer_port(exclude=_claimed_ports)
         if port and not self._connected:
             # Select in combo
             idx = self.port_combo.findText(port)
@@ -631,7 +711,8 @@ class ProgramsTab(QWidget):
         self.load_btn.setEnabled(v and bool(self._selected or self._active))
 
     def add_page(self, names, more, total):
-        self._all.extend(names)
+        existing = set(self._all)
+        self._all.extend(n for n in names if n not in existing)
         self._rebuild(self.search.text())
         self.load_more_btn.setVisible(more)
         self.count_lbl.setText(
@@ -1001,7 +1082,7 @@ class SmoothFader(QWidget):
         self._velocity     = 0.0   # momentum
         self._last_drag_y  = None
         self.setMinimumHeight(200)
-        self.setMinimumWidth(60)
+        self.setMinimumWidth(30)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
 
         self._timer = QTimer()
@@ -1059,7 +1140,7 @@ class SmoothFader(QWidget):
         track_w = 8
         frac = self._frac()
         fill_h = int(h * frac)
-        handle_w, handle_h = 40, 24
+        handle_w, handle_h = 20, 24
         half_h = handle_h // 2
         # Clamp so handle never clips outside widget bounds
         hy = int(h * (1.0 - frac))
@@ -1095,7 +1176,7 @@ class SmoothFader(QWidget):
         cx = hx + handle_w // 2
         for offset in (-4, 0, 4):
             ly = hy + offset
-            p.drawLine(cx - 10, ly, cx + 10, ly)
+            p.drawLine(cx - 5, ly, cx + 5, ly)
 
         p.end()
 
@@ -1457,8 +1538,8 @@ class ModBar(QWidget):
         self._history_len = 120  # ~12s at 100ms poll
         self._display_val = 0.0  # smoothed current value
         self._target_val = 0.0
-        self.setFixedHeight(20)
-        self.setMinimumWidth(40)
+        self.setFixedHeight(70)
+        self.setMinimumWidth(10)
 
         # Smooth render timer — 60fps interpolation
         self._render_timer = QTimer()
@@ -1661,10 +1742,11 @@ class ChannelCard(QWidget):
         if self._is_toggle:
             root.addStretch(1)
             val_row = QHBoxLayout()
-            val_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+            val_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.toggle = QPushButton("OFF")
             self.toggle.setCheckable(True)
             self.toggle.setFixedHeight(40)
+            self.toggle.setMaximumWidth(80)
             self.toggle.setStyleSheet(f"""
                 QPushButton {{
                     background:{SURFACE2}; border:2px solid {BORDER};
@@ -1677,7 +1759,7 @@ class ChannelCard(QWidget):
                 }}
             """)
             self.toggle.toggled.connect(self._on_toggle)
-            val_row.addWidget(self.toggle)
+            val_row.addWidget(self.toggle, alignment=Qt.AlignmentFlag.AlignCenter)
             root.addLayout(val_row)
             self.val_lbl = None
             self.slider  = None
@@ -1714,7 +1796,7 @@ class ChannelCard(QWidget):
             knob_col = QVBoxLayout()
             knob_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
             knob_col.setSpacing(2)
-            self.knob = KnobWidget(size=56)
+            self.knob = KnobWidget(size=52)
             self.knob.setRange(0, PARAM_RANGE)
             self.knob.setValue(0)
             self.knob.valueChanged.connect(self._on_knob)
@@ -1743,7 +1825,7 @@ class ChannelCard(QWidget):
                 col = QVBoxLayout()
                 col.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 col.setSpacing(3)
-                mini = KnobWidget(size=36)
+                mini = KnobWidget(size=32)
                 mini.setRange(0, PARAM_RANGE)
                 mini.setValue(512)
                 _field = field
@@ -1785,7 +1867,12 @@ class ChannelCard(QWidget):
             # Live modulation output bar
             root.addSpacing(2)
             self._out_bar = ModBar()
-            root.addWidget(self._out_bar)
+            self._out_bar.setFixedWidth(216)
+            bar_row = QHBoxLayout()
+            bar_row.addStretch(1)
+            bar_row.addWidget(self._out_bar)
+            bar_row.addStretch(1)
+            root.addLayout(bar_row)
             return  # skip old TSS section
 
         # ── TSS mini knobs for toggle/fader channels ──
@@ -1800,7 +1887,7 @@ class ChannelCard(QWidget):
             col = QVBoxLayout()
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
             col.setSpacing(2)
-            mini = KnobWidget(size=36)
+            mini = KnobWidget(size=32)
             mini.setRange(0, PARAM_RANGE)
             mini.setValue(512)
             _field = field
@@ -1841,7 +1928,12 @@ class ChannelCard(QWidget):
         # Live modulation output bar
         root.addSpacing(2)
         self._out_bar = ModBar()
-        root.addWidget(self._out_bar)
+        self._out_bar.setFixedWidth(216)
+        bar_row2 = QHBoxLayout()
+        bar_row2.addStretch(1)
+        bar_row2.addWidget(self._out_bar)
+        bar_row2.addStretch(1)
+        root.addLayout(bar_row2)
 
     def set_param_label(self, name: str, lo: int = 0, hi: int = 100):
         """Set parameter name — shown below knob or above toggle button."""
@@ -2121,73 +2213,39 @@ class ParametersTab(QWidget):
         # Time/Space/Slope are GLOBAL macro controls (one set total)
         self.channels: List[ChannelCard] = []
 
-        # ── Main panel: P1-P11 + P12 fader ──
+        # ── Main panel: [P1-P6 | P12 fader] over [P7-P11 full width] ──
         panel = QWidget()
         panel.setStyleSheet(f"background:{BG};border:none;")
-        panel_h = QHBoxLayout(panel)
-        panel_h.setContentsMargins(0, 0, 0, 0)
-        panel_h.setSpacing(10)
+        panel_v = QVBoxLayout(panel)
+        panel_v.setContentsMargins(0, 0, 0, 0)
+        panel_v.setSpacing(10)
 
-        # Left: P1-P6 knobs + P7-P11 switches
-        left_widget = QWidget()
-        left_widget.setStyleSheet("background:transparent;border:none;")
-        left_v = QVBoxLayout(left_widget)
-        left_v.setContentsMargins(0, 0, 0, 0)
-        left_v.setSpacing(4)
+        # Top row: P1-P6 knobs (left) + P12 fader (right)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
 
         # P1-P6 parameter knobs — 3+3 grid matching front panel
         knobs_grid = QGridLayout()
         knobs_grid.setHorizontalSpacing(10)
-        knobs_grid.setVerticalSpacing(24)
+        knobs_grid.setVerticalSpacing(14)
         for col in range(3):
             knobs_grid.setColumnStretch(col, 1)
         knobs_grid.setRowStretch(0, 1)
         knobs_grid.setRowStretch(1, 1)
         for i in range(6):
             card = ChannelCard(i)
-            card.setMinimumHeight(220)
-            card.setMaximumHeight(420)
+            card.setMinimumHeight(320)
+            card.setMaximumHeight(500)
             card.on_manual_change = self._manual_changed
             card.on_mod_change    = self._mod_changed
             self.channels.append(card)
             row, col = divmod(i, 3)
             knobs_grid.addWidget(card, row, col)
-        left_v.addLayout(knobs_grid, stretch=1)
-        left_v.addSpacing(12)
+        top_row.addLayout(knobs_grid, stretch=5)
 
-        # Row 2: P7-P11 — one long bordered container
-        sw_container = QWidget()
-        sw_container.setStyleSheet(f"""
-            QWidget#sw_container {{
-                background: {SURFACE};
-                border: 2px solid {BORDER};
-                border-radius: 8px;
-            }}
-        """)
-        sw_container.setObjectName("sw_container")
-        sw_inner = QHBoxLayout(sw_container)
-        sw_inner.setContentsMargins(8, 8, 8, 4)
-        sw_inner.setSpacing(6)
-        for i in range(6, 11):
-            card = ChannelCard(i)
-            card.setMinimumHeight(190)
-            card.setMaximumHeight(300)
-            card.setStyleSheet("QWidget { background: transparent; border: none; }")
-            card.on_manual_change = self._manual_changed
-            card.on_mod_change    = self._mod_changed
-            self.channels.append(card)
-            sw_inner.addWidget(card, stretch=1)
-            if i < 10:
-                div = QFrame()
-                div.setFrameShape(QFrame.Shape.VLine)
-                div.setStyleSheet(f"background:{BORDER};max-width:1px;border:none;")
-                sw_inner.addWidget(div)
-        left_v.addWidget(sw_container, stretch=0)
-
-        panel_h.addWidget(left_widget, stretch=5)
-
-        # Right: P12 full-height vertical fader
+        # Right: P12 vertical fader — narrow, full height of knobs row
         fader_widget = QWidget()
+        fader_widget.setMaximumWidth(160)
         fader_widget.setStyleSheet(f"""
             QWidget {{
                 background:{SURFACE};
@@ -2196,7 +2254,7 @@ class ParametersTab(QWidget):
             }}
         """)
         fader_v = QVBoxLayout(fader_widget)
-        fader_v.setContentsMargins(12, 10, 12, 10)
+        fader_v.setContentsMargins(4, 8, 4, 8)
         fader_v.setSpacing(4)
 
         p12_lbl = QLabel("P12")
@@ -2206,13 +2264,13 @@ class ParametersTab(QWidget):
             f"background:transparent;border:none;"
         )
         fader_v.addWidget(p12_lbl)
+        fader_v.addSpacing(6)
 
         # Create P12 ChannelCard but use its slider vertically
         card12 = ChannelCard(11)
         card12.on_manual_change = self._manual_changed
         card12.on_mod_change    = self._mod_changed
         card12.setStyleSheet("background:transparent;border:none;")
-        self.channels.append(card12)
 
         # Replace its horizontal slider with a smooth vertical fader
         if card12.slider:
@@ -2224,6 +2282,7 @@ class ParametersTab(QWidget):
             card12.slider = vert_slider
             fader_v.addWidget(vert_slider, stretch=1,
                               alignment=Qt.AlignmentFlag.AlignHCenter)
+        fader_v.addSpacing(16)
 
         self.val_lbl_12 = QLabel("0%")
         self.val_lbl_12.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2250,7 +2309,7 @@ class ParametersTab(QWidget):
             col12 = QVBoxLayout()
             col12.setAlignment(Qt.AlignmentFlag.AlignCenter)
             col12.setSpacing(2)
-            mini12 = KnobWidget(size=32)
+            mini12 = KnobWidget(size=24)
             mini12.setRange(0, PARAM_RANGE)
             mini12.setValue(512)
             _f = field
@@ -2291,9 +2350,48 @@ class ParametersTab(QWidget):
         # LFO waveform for P12
         fader_v.addSpacing(2)
         card12._out_bar = ModBar()
-        fader_v.addWidget(card12._out_bar)
+        card12._out_bar.setFixedWidth(140)
+        fader_v.addWidget(card12._out_bar, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        panel_h.addWidget(fader_widget, stretch=1)
+        # Wrap fader in a column that extends 80px below the knobs row
+        fader_col = QVBoxLayout()
+        fader_col.addWidget(fader_widget, stretch=1)
+        top_row.addLayout(fader_col, stretch=1)
+        panel_v.addLayout(top_row, stretch=1)
+        panel_v.addSpacing(8)
+
+        # P7-P11 switches — full width to edges
+        sw_container = QWidget()
+        sw_container.setStyleSheet(f"""
+            QWidget#sw_container {{
+                background: {SURFACE};
+                border: 2px solid {BORDER};
+                border-radius: 8px;
+            }}
+        """)
+        sw_container.setObjectName("sw_container")
+        sw_inner = QHBoxLayout(sw_container)
+        sw_inner.setContentsMargins(8, 8, 8, 10)
+        sw_inner.setSpacing(6)
+        for i in range(6, 11):
+            card = ChannelCard(i)
+            card.setMinimumHeight(220)
+            card.setMaximumHeight(330)
+            card.setStyleSheet("QWidget { background: transparent; border: none; }")
+            card.on_manual_change = self._manual_changed
+            card.on_mod_change    = self._mod_changed
+            self.channels.append(card)
+            sw_inner.addWidget(card, stretch=1)
+            if i < 10:
+                div = QFrame()
+                div.setFrameShape(QFrame.Shape.VLine)
+                div.setStyleSheet(f"background:{BORDER};max-width:1px;border:none;")
+                sw_inner.addWidget(div)
+        panel_v.addWidget(sw_container, stretch=0)
+
+        # Append P12 last so channels list order matches device: P1-P11, P12
+        self.channels.append(card12)
+
         root.addWidget(panel, stretch=1)
 
         self._set_enabled(False)
@@ -2346,15 +2444,25 @@ class ParametersTab(QWidget):
         now = __import__('time').monotonic()
         for i, mod in enumerate(modulators[:12]):
             card = self.channels[i]
-            # Skip channels edited within the last 2.5 seconds
+            # Skip channels edited within the last 0.6 seconds
+            # BUT always update toggle switches (device state is authoritative)
             last_edit = self._last_sent.get(f"edit_time_{i}", 0)
-            if now - last_edit < 0.6:
-                continue
+            recently_edited = now - last_edit < 0.6
             m = mod.get("m", 512)
-            o = mod.get("o", m)
-            card.set_manual(m)
-            card.set_operator(mod.get("s", 0))
-            card.set_output(o)
+            if card._is_toggle:
+                # Always sync toggle state from device
+                card.set_manual(m)
+                card.set_operator(mod.get("s", 0))
+                # Only show LFO output on ModBar, not raw switch value
+                if "o" in mod:
+                    card.set_output(mod["o"])
+            else:
+                if recently_edited:
+                    continue
+                o = mod.get("o", m)
+                card.set_manual(m)
+                card.set_operator(mod.get("s", 0))
+                card.set_output(o)
 
     def set_transport_state(self, state: str):
         """Update play/stop button styling based on transport state."""
@@ -3050,7 +3158,7 @@ class SystemTab(QWidget):
         top = QHBoxLayout()
         title = QLabel("SYSTEM")
         title.setStyleSheet(
-            f"color:#ffffff;font-size:16px;font-weight:bold;"
+            f"color:#ffffff;font-size:22px;font-weight:bold;"
             f"letter-spacing:3px;{self._TRANSPARENT}"
         )
         top.addWidget(title)
@@ -3073,6 +3181,7 @@ class SystemTab(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(0)
 
         # ── Left column: Video + Status ──
         left = QWidget()
@@ -3088,7 +3197,7 @@ class SystemTab(QWidget):
         # Source: HDMI / Analog toggle buttons
         src_row = QHBoxLayout()
         src_lbl = QLabel("Source")
-        src_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;min-width:60px;{self._TRANSPARENT}")
+        src_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
         src_row.addWidget(src_lbl)
         self._src_hdmi_btn = QPushButton("HDMI")
         self._src_hdmi_btn.setCheckable(True)
@@ -3109,7 +3218,7 @@ class SystemTab(QWidget):
         # Analog connection type (shown when analog selected)
         self._analog_row = QHBoxLayout()
         analog_lbl = QLabel("Analog In")
-        analog_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;min-width:60px;{self._TRANSPARENT}")
+        analog_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
         self._analog_row.addWidget(analog_lbl)
         self._conn_cvbs_btn  = QPushButton("CVBS / COMPOSITE")
         self._conn_cvbs_btn.setCheckable(True)
@@ -3128,7 +3237,7 @@ class SystemTab(QWidget):
         # Timing selector
         timing_row = QHBoxLayout()
         timing_lbl = QLabel("Timing")
-        timing_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;min-width:60px;{self._TRANSPARENT}")
+        timing_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
         timing_row.addWidget(timing_lbl)
 
         self.timing_combo = QComboBox()
@@ -3161,7 +3270,7 @@ class SystemTab(QWidget):
         vl.addLayout(timing_row)
 
         timing_note = QLabel("Changing timing restarts video output")
-        timing_note.setStyleSheet(f"color:{WARN};font-size:10px;{self._TRANSPARENT}")
+        timing_note.setStyleSheet(f"color:{WARN};font-size:16px;{self._TRANSPARENT}")
         vl.addWidget(timing_note)
 
         ll.addWidget(vid_grp)
@@ -3175,25 +3284,24 @@ class SystemTab(QWidget):
         for label, key in [
             ("Source",          "source"),
             ("Timing",          "timing"),
-            ("Output Timing",   "output_timing"),
             ("Frame Rate",      "framerate"),
-            ("Signal Locked",   "locked"),
-            ("Analog IN Lock",  "analog_locked"),
-            ("Analog Timing",   "analog_timing"),
-            ("HDMI IN",         "hdmi_locked"),
-            ("HDMI OUT",        "hdmi_connected"),
-            ("Ext VSync",       "external_vsync"),
         ]:
             row = QHBoxLayout()
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;min-width:120px;{self._TRANSPARENT}")
+            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:140px;{self._TRANSPARENT}")
             row.addWidget(lbl)
+            sep = QLabel(":")
+            sep.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;{self._TRANSPARENT}")
+            sep.setFixedWidth(12)
+            row.addWidget(sep)
+            row.addSpacing(10)
             val = QLabel("\u2014")
-            val.setStyleSheet(f"color:{TEXT};font-size:12px;font-weight:bold;{self._TRANSPARENT}")
+            val.setStyleSheet(f"color:{TEXT};font-size:18px;font-weight:bold;{self._TRANSPARENT}")
             row.addWidget(val, stretch=1)
             sl.addLayout(row)
             self._status_fields[key] = val
 
+        sl.addSpacing(40)
         self.refresh_status_btn = QPushButton("Refresh Status")
         self.refresh_status_btn.setEnabled(False)
         self.refresh_status_btn.clicked.connect(self._fetch_status)
@@ -3223,10 +3331,10 @@ class SystemTab(QWidget):
         ]:
             row = QHBoxLayout()
             lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;min-width:80px;{self._TRANSPARENT}")
+            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:80px;{self._TRANSPARENT}")
             row.addWidget(lbl)
             val = QLabel("\u2014")
-            val.setStyleSheet(f"color:{TEXT};font-size:13px;font-weight:bold;{self._TRANSPARENT}")
+            val.setStyleSheet(f"color:{TEXT};font-size:19px;font-weight:bold;{self._TRANSPARENT}")
             row.addWidget(val, stretch=1)
             fl.addLayout(row)
             self._fw_fields[key] = val
@@ -3244,7 +3352,7 @@ class SystemTab(QWidget):
         self.midi_table.setReadOnly(True)
         self.midi_table.setMaximumHeight(180)
         self.midi_table.setStyleSheet(
-            f"background:{SURFACE};color:{TEXT};font-size:12px;"
+            f"background:{SURFACE};color:{TEXT};font-size:18px;"
             f"border:1px solid {BORDER};border-radius:4px;"
         )
         ml.addWidget(self.midi_table)
@@ -3276,6 +3384,23 @@ class SystemTab(QWidget):
         if not v:
             for val in self._fw_fields.values():
                 val.setText("\u2014")
+            for val in self._status_fields.values():
+                val.setText("\u2014")
+                val.setStyleSheet(
+                    f"color:{TEXT};font-size:18px;font-weight:bold;"
+                    f"{self._TRANSPARENT}"
+                )
+
+    @staticmethod
+    def _is_true(v) -> bool:
+        """Handle bool, int, and string representations of true/false."""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        if isinstance(v, str):
+            return v.lower() in ("true", "yes", "1", "locked")
+        return bool(v)
 
     def apply_video_status(self, data: dict):
         src = data.get("source", "—")
@@ -3283,43 +3408,16 @@ class SystemTab(QWidget):
         timing = data.get("timing", "—")
         self._status_fields["timing"].setText(timing)
 
-        # Output timing and framerate
-        output = data.get("output", {})
-        out_timing = output.get("timing", "—")
-        self._status_fields["output_timing"].setText(out_timing)
-
         # Derive framerate from timing string
+        output = data.get("output") or {}
+        out_timing = output.get("timing", "—")
         fps = _timing_to_fps(out_timing or timing)
         self._status_fields["framerate"].setText(fps)
         self._status_fields["framerate"].setStyleSheet(
-            f"color:#ffffff;font-size:13px;font-weight:bold;{self._TRANSPARENT}"
+            f"color:#ffffff;font-size:19px;font-weight:bold;{self._TRANSPARENT}"
         )
 
-        locked = data.get("locked", False)
-        self._status_fields["locked"].setText(
-            "YES — LOCKED" if locked else "NO — UNLOCKED"
-        )
-        self._status_fields["locked"].setStyleSheet(
-            f"color:{'#ffffff' if locked else ERROR};font-size:12px;font-weight:bold;{self._TRANSPARENT}"
-        )
-        analog = data.get("analog", {})
-        hdmi   = data.get("hdmi", {})
-        # Analog status
-        self._status_fields["analog_locked"].setText(
-            "YES" if analog.get("locked") else "NO"
-        )
-        self._status_fields["analog_timing"].setText(
-            analog.get("timing", "—")
-        )
-        self._status_fields["hdmi_locked"].setText(
-            "YES" if hdmi.get("locked") else "NO"
-        )
-        self._status_fields["hdmi_connected"].setText(
-            "YES" if hdmi.get("connected") else "NO"
-        )
-        self._status_fields["external_vsync"].setText(
-            "YES" if data.get("external_vsync") else "NO"
-        )
+        locked = self._is_true(data.get("locked", False))
         # Sync source toggle buttons
         self._src_hdmi_btn.setChecked(src == "hdmi")
         self._src_analog_btn.setChecked(src == "analog")
@@ -3365,8 +3463,8 @@ class SystemTab(QWidget):
         self.src_combo.blockSignals(False)
         if self.on_send:
             self.on_send(f"video input {src}")
-        # Poll video status 3 times over 3 seconds to catch lock
-        for delay in [800, 1800, 3000]:
+        # Poll video status repeatedly to catch lock (HDMI re-lock can be slow)
+        for delay in [500, 1500, 3000, 5000, 8000, 12000]:
             QTimer.singleShot(delay, self._fetch_status)
 
     def _set_analog_conn(self, conn: str):
@@ -3395,15 +3493,15 @@ class SystemTab(QWidget):
         self._fetch_version()
 
     def _fetch_status(self):
-        if self.on_send:
+        if self.on_send and self._connected:
             self.on_send("video status")
 
     def _fetch_midi(self):
-        if self.on_send:
+        if self.on_send and self._connected:
             self.on_send("modulation cc-map")
 
     def _fetch_version(self):
-        if self.on_send:
+        if self.on_send and self._connected:
             self.on_send("version")
 
 
@@ -3432,12 +3530,13 @@ class StateTab(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setSpacing(12)
 
         top = QHBoxLayout()
         title = QLabel("STATE")
         title.setStyleSheet(
-            f"color:#ffffff;font-size:16px;font-weight:bold;letter-spacing:3px;"
+            f"color:#ffffff;font-size:22px;font-weight:bold;"
+            f"letter-spacing:3px;background:transparent;border:none;"
         )
         top.addWidget(title)
         top.addStretch()
@@ -3680,11 +3779,17 @@ class StateTab(QWidget):
 
 class VideomancerApp(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, window_number: int = 1):
         super().__init__()
-        self.setWindowTitle("VIDEOMANCER CONTROL")
-        self.resize(1280, 960)
-        self.setMinimumSize(1050, 820)
+        self._window_number = window_number
+        self._window_label = f"[Unit {window_number}]" if window_number > 0 else ""
+        self._claimed_port: Optional[str] = None
+        title = "VIDEOMANCER CONTROL"
+        if self._window_label:
+            title += f" {self._window_label}"
+        self.setWindowTitle(title)
+        self.resize(1280, 1080)
+        self.setMinimumSize(1050, 960)
         self.setStyleSheet(STYLESHEET)
 
         self._worker: Optional[SerialWorker] = None
@@ -3722,6 +3827,11 @@ class VideomancerApp(QMainWindow):
         self._hotplug_timer.timeout.connect(self._hotplug_scan)
         # Delay first scan — give auto-connect time to run first
         QTimer.singleShot(1500, self._hotplug_timer.start)
+
+        # Check for app updates in background
+        self._update_checker = _UpdateChecker()
+        self._update_checker.update_available.connect(self._on_update_available)
+        self._update_checker.start()
 
     # ------------------------------------------------------------------
     # UI
@@ -3885,6 +3995,43 @@ class VideomancerApp(QMainWindow):
 
         lay.addStretch()
 
+        # Dual Cast — toggle a second window
+        self._dual_btn = QPushButton("Dual Cast")
+        self._dual_btn.setCheckable(True)
+        self._dual_btn.setFixedHeight(32)
+        self._dual_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{SURFACE2}; border:2px solid {BORDER};
+                border-radius:5px; color:{TEXT_DIM};
+                font-size:13px; font-weight:bold; padding:2px 14px;
+            }}
+            QPushButton:checked {{
+                background:#7c3aed; border:2px solid #ffffff;
+                color:#ffffff;
+            }}
+        """)
+        self._dual_btn.toggled.connect(self._toggle_dual_cast)
+        lay.addWidget(self._dual_btn)
+        self._dual_window = None
+
+        # Update available banner (hidden until check completes)
+        self._update_btn = QPushButton("")
+        self._update_btn.setFixedHeight(28)
+        self._update_btn.setVisible(False)
+        self._update_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:#2d1f5e; border:1px solid {ACCENT};
+                border-radius:4px; color:#a78bfa;
+                font-size:12px; font-weight:bold; padding:2px 10px;
+            }}
+            QPushButton:hover {{
+                background:#3d2f7e; color:#ffffff;
+            }}
+        """)
+        self._update_btn.clicked.connect(self._open_update_url)
+        lay.addWidget(self._update_btn)
+        self._update_url = ""
+
         # Connection bar lives in header
         self.conn_bar = ConnectionBar()
         self.conn_bar.on_connect    = self._do_connect
@@ -3897,6 +4044,37 @@ class VideomancerApp(QMainWindow):
         lay.addWidget(self._header_prog)
 
         return w
+
+    # ------------------------------------------------------------------
+    # Dual Cast
+    # ------------------------------------------------------------------
+
+    def _toggle_dual_cast(self, checked: bool):
+        if checked:
+            if self._dual_window is None or not self._dual_window.isVisible():
+                num = len(_app_windows) + 1
+                self._dual_window = _spawn_window(num)
+                self._dual_window._parent_dual_btn = self._dual_btn
+        else:
+            if self._dual_window is not None and self._dual_window.isVisible():
+                self._dual_window._parent_dual_btn = None
+                self._dual_window.close()
+            self._dual_window = None
+
+    # ------------------------------------------------------------------
+    # Auto-update
+    # ------------------------------------------------------------------
+
+    def _on_update_available(self, version: str, url: str):
+        self._update_url = url
+        self._update_btn.setText(f"v{version} available — click to download")
+        self._update_btn.setVisible(True)
+
+    def _open_update_url(self):
+        if self._update_url:
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(self._update_url))
 
     # ------------------------------------------------------------------
     # Connection
@@ -3946,13 +4124,16 @@ class VideomancerApp(QMainWindow):
 
     @pyqtSlot(str)
     def _on_connected(self, port: str):
+        _claimed_ports.add(port)
+        self._claimed_port = port
         self.conn_bar.set_connected(port)
         self.prog_tab.set_connected(True)
         self.param_tab.set_connected(True)
         self.system_tab.set_connected(True)
         self.state_tab.set_connected(True)
         self.snap_tab.set_connected(True)
-        self.setWindowTitle(f"VIDEOMANCER CONTROL — {port}")
+        label = self._window_label
+        self.setWindowTitle(f"VIDEOMANCER CONTROL {label} — {port}")
         self.status_bar.showMessage(f"Connected — {port}  (waiting for boot…)")
         self.console.append("ok", "connected", port)
         # Track connection time for local uptime display
@@ -3962,11 +4143,16 @@ class VideomancerApp(QMainWindow):
         self._uptime_timer.timeout.connect(self._update_uptime)
         self._uptime_timer.start()
         # Start bidirectional sync polling
+        self._poll_count = 0
         self._poll_timer.start()
         self.conn_bar.data_refresh_btn.setEnabled(True)
 
     @pyqtSlot()
     def _on_disconnected(self):
+        # Release claimed port
+        if hasattr(self, '_claimed_port') and self._claimed_port:
+            _claimed_ports.discard(self._claimed_port)
+            self._claimed_port = None
         self._poll_timer.stop()
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
@@ -3977,8 +4163,16 @@ class VideomancerApp(QMainWindow):
         self.system_tab.set_connected(False)
         self.state_tab.set_connected(False)
         self.snap_tab.set_connected(False)
-        self.setWindowTitle("VIDEOMANCER CONTROL")
+        label = self._window_label
+        self.setWindowTitle(f"VIDEOMANCER CONTROL {label}")
         self.status_bar.showMessage("Disconnected — waiting for device…")
+        # Clear active program and switch to Programs tab (splash screen)
+        self._active_program = None
+        if hasattr(self, 'conn_bar') and hasattr(self.conn_bar, '_prog_lbl'):
+            self.conn_bar._prog_lbl.setVisible(False)
+        if hasattr(self, '_header_prog'):
+            self._header_prog.setText("")
+        self.tabs.setCurrentIndex(0)
         for w in [self._sb_prog, self._sb_vid, self._sb_fw]:
             w.setText(w.text().split(":")[0] + ": —")
         self.console.append("log", "", "Serial connection closed")
@@ -4119,6 +4313,7 @@ class VideomancerApp(QMainWindow):
             else:
                 try:
                     data = json.loads(payload)
+                    self.console.append("ok", "video-raw", str(data))
                     self.system_tab.apply_video_status(data)
                     # Update status bar
                     src    = data.get("source", "").upper()
@@ -4127,6 +4322,7 @@ class VideomancerApp(QMainWindow):
                     self._sb_vid.setText(f"Video: {src} {timing} {locked}")
                 except Exception as exc:
                     self.console.append("error", "json", f"Bad video payload: {exc}")
+                    self._sb_vid.setText("Video: parse error")
 
         elif key == "modulation":
             try:
@@ -4147,11 +4343,7 @@ class VideomancerApp(QMainWindow):
                         self.tabs.setCurrentIndex(1)
                 self._last_active_mod = active
 
-                if self._user_editing:
-                    # Don't update any controls while user is actively editing
-                    pass
-                else:
-                    self.param_tab.apply_modulation_status(mods)
+                self.param_tab.apply_modulation_status(mods)
             if "assignments" in data:
                 self.system_tab.apply_midi_cc(data["assignments"])
 
@@ -4320,6 +4512,8 @@ class VideomancerApp(QMainWindow):
         self._poll_count += 1
         if self._poll_count % 10 == 0:
             self._worker.send("transport status")
+        if self._poll_count % 50 == 0:
+            self._worker.send("video status")
 
     def _request_state(self):
         if self._worker and not self._user_editing:
@@ -4521,7 +4715,7 @@ class VideomancerApp(QMainWindow):
         elif idx == 2: # System
             self._worker.send("video status")
             self._worker.send("modulation cc-map")
-            self._worker.send("transport status")
+            self._worker.send("version")
         elif idx == 3: # State
             self._fetch_presets()
             self.state_tab._reload_snapshots()
@@ -4540,7 +4734,7 @@ class VideomancerApp(QMainWindow):
         elif idx == 2: # System
             self._worker.send("video status")
             self._worker.send("modulation cc-map")
-            self._worker.send("transport status")
+            self._worker.send("version")
         elif idx == 3: # State
             self._fetch_presets()
             self.state_tab._reload_snapshots()
@@ -4553,10 +4747,28 @@ class VideomancerApp(QMainWindow):
         if self._worker:
             self._worker.disconnect_port()
             self._worker.wait(2000)
+        # Release claimed port and remove from global window list
+        if self._claimed_port:
+            _claimed_ports.discard(self._claimed_port)
+            self._claimed_port = None
+        if self in _app_windows:
+            _app_windows.remove(self)
+        # If this window was spawned by Dual Cast, uncheck the parent button
+        btn = getattr(self, '_parent_dual_btn', None)
+        if btn is not None:
+            btn.setChecked(False)
         event.accept()
 
 
 # ── Entry point ────────────────────────────────────────────────────────
+
+def _spawn_window(number: int) -> VideomancerApp:
+    """Create and show a new VideomancerApp window."""
+    w = VideomancerApp(window_number=number)
+    _app_windows.append(w)
+    w.show()
+    return w
+
 
 def main():
     app = QApplication(sys.argv)
@@ -4575,8 +4787,30 @@ def main():
     except Exception:
         pass
 
-    window = VideomancerApp()
-    window.show()
+    # Detect how many Videomancer devices are already plugged in
+    initial_ports = ConnectionBar.find_all_videomancer_ports()
+    count = max(1, len(initial_ports))  # always open at least one window
+    for i in range(count):
+        _spawn_window(i + 1)
+
+    # Global hot-plug watcher: spawn a new window when a new device appears
+    def _global_hotplug():
+        all_ports = ConnectionBar.find_all_videomancer_ports()
+        unclaimed = [p for p in all_ports if p not in _claimed_ports]
+        # Only spawn if there's an unclaimed device AND every existing
+        # window already has a connection (avoids duplicate empty windows)
+        if unclaimed:
+            all_connected = all(
+                w._worker and w._worker.isRunning() for w in _app_windows
+            )
+            if all_connected:
+                _spawn_window(len(_app_windows) + 1)
+
+    hotplug = QTimer()
+    hotplug.setInterval(3000)
+    hotplug.timeout.connect(_global_hotplug)
+    hotplug.start()
+
     sys.exit(app.exec())
 
 

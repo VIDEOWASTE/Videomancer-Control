@@ -90,7 +90,8 @@ class SerialWorker(QThread):
 
         # Initial queries
         for cmd in ["version", "status", "programs list",
-                    "modulation status", "transport status"]:
+                    "modulation status", "transport status",
+                    "video status"]:
             self._write(cmd + "\n")
             time.sleep(0.03)
 
@@ -159,8 +160,8 @@ class SerialWorker(QThread):
             try:
                 data = json.loads(payload)
                 self.status_update.emit(data)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.response.emit("error", "json", f"Bad status payload: {exc}")
         elif key == "programs":
             try:
                 data = json.loads(payload)
@@ -169,5 +170,5 @@ class SerialWorker(QThread):
                 nxt   = data.get("next", 0)
                 total = data.get("count", len(names))
                 self.programs_page.emit(names, more, nxt, total)
-            except Exception:
-                pass
+            except Exception as exc:
+                self.response.emit("error", "json", f"Bad programs payload: {exc}")
