@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -32,8 +32,10 @@ from PyQt6.QtWidgets import (
     QTabWidget, QSlider, QCheckBox, QScrollArea, QGridLayout,
     QSizePolicy, QMessageBox, QInputDialog, QDialog, QDialogButtonBox,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread
-from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QFont
+import math
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, QRectF, QPointF
+from PyQt6.QtGui import (QColor, QTextCharFormat, QTextCursor, QFont,
+                          QPainter, QPen, QLinearGradient, QPainterPath)
 
 try:
     import serial.tools.list_ports as list_ports
@@ -158,21 +160,21 @@ QTabWidget::pane {{
     padding: 4px;
 }}
 QTabBar {{
-    padding: 30px 4px 6px 4px;
+    padding: 12px 4px 4px 4px;
     qproperty-drawBase: 0;
 }}
 QTabBar::tab {{
     background: {SURFACE};
     border: 2px solid #444444;
     color: #777777;
-    padding: 10px 28px;
+    padding: 8px 18px;
     font-family: "Goldplay","SF Pro Display",sans-serif;
-    font-size: 19px;
+    font-size: 16px;
     font-weight: bold;
     letter-spacing: 2px;
-    margin-right: 8px;
-    border-radius: 6px;
-    min-width: 90px;
+    margin-right: 4px;
+    border-radius: 4px;
+    min-width: 66px;
 }}
 QTabBar::tab:selected {{
     background: {SURFACE2};
@@ -943,11 +945,11 @@ class KnobWidget(QWidget):
         self.setFixedSize(size, size)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         # Smooth interpolation timer — 60fps
         self._smooth_timer = QTimer()
-        self._smooth_timer.setInterval(16)
+        self._smooth_timer.setInterval(16)  # 60fps when active
         self._smooth_timer.timeout.connect(self._smooth_step)
-        self._smooth_timer.start()
 
     def value(self):    return self._value
     def minimum(self):  return self._min
@@ -955,32 +957,35 @@ class KnobWidget(QWidget):
 
     def setValue(self, v: int, animate: bool = True):
         v = max(self._min, min(self._max, int(v)))
+        if self._user_dragging:
+            return
         if v == self._value:
             return
         self._value = v
         new_frac = (v - self._min) / max(1, self._max - self._min)
         self._frac = new_frac
-        if self._user_dragging or not animate:
-            self._display_frac = new_frac
-        elif self._display_frac == 0.0 and new_frac != 0.0:
-            self._display_frac = new_frac
-        # else: smooth_step handles glide
+        self._display_frac = new_frac
         self.update()
         self.valueChanged.emit(v)
 
+    def _ensure_timer(self):
+        if not self._smooth_timer.isActive():
+            self._smooth_timer.start()
+
     def _smooth_step(self):
-        """Glide display_frac toward frac."""
-        diff = self._frac - self._display_frac
+        """Timer-driven glide — only runs when animating."""
         if self._user_dragging:
+            self._smooth_timer.stop()
+            return
+        diff = self._frac - self._display_frac
+        if abs(diff) > 0.001:
+            self._display_frac += diff * 0.4
+            self.update()
+        elif self._display_frac != self._frac:
             self._display_frac = self._frac
             self.update()
         else:
-            if abs(diff) > 0.005:
-                self._display_frac += diff * 0.45
-                self.update()
-            elif self._display_frac != self._frac:
-                self._display_frac = self._frac
-                self.update()
+            self._smooth_timer.stop()  # settled — stop until needed
 
     def setRange(self, mn, mx):
         self._min, self._max = mn, mx
@@ -988,10 +993,6 @@ class KnobWidget(QWidget):
         self._display_frac = self._frac  # sync on range change
 
     def paintEvent(self, _e):
-        import math
-        from PyQt6.QtGui import QPainter, QPen, QColor
-        from PyQt6.QtCore import QRectF, QPointF, Qt
-
         s    = self._size
         cx   = cy = s * 0.5
         # Scale all dimensions relative to knob size
@@ -1037,22 +1038,29 @@ class KnobWidget(QWidget):
 
     def mousePressEvent(self, e):
         self._drag_y = e.globalPosition().y()
-        self._drag_v = float(self._value)
+        self._drag_accum = float(self._value)
         self._user_dragging = True
-        self._display_frac = self._frac   # snap arc to true position on grab
-        self.update()
+        self._display_frac = self._frac
 
     def mouseMoveEvent(self, e):
         if self._drag_y is None:
             return
-        dy   = self._drag_y - e.globalPosition().y()
-        # Accumulate as float — emit only when integer changes
-        newf = self._drag_v + dy * (self._max - self._min) / 180.0
-        newi = int(round(max(self._min, min(self._max, newf))))
+        cur_y = e.globalPosition().y()
+        dy = self._drag_y - cur_y
+        if dy == 0:
+            return
+        self._drag_y = cur_y
+        # Fine sensitivity — float accumulator for sub-pixel smoothness
+        self._drag_accum += dy * (self._max - self._min) / 300.0
+        self._drag_accum = max(float(self._min), min(float(self._max), self._drag_accum))
+        # Update frac from float ��� direct feedback + timer coalesces
+        self._frac = (self._drag_accum - self._min) / max(1, self._max - self._min)
+        self._display_frac = self._frac
+        self.update()  # Qt coalesces — no double paint, zero latency
+        # Emit integer value change directly (like v1.0)
+        newi = int(round(self._drag_accum))
         if newi != self._value:
             self._value = newi
-            self._frac  = (newi - self._min) / max(1, self._max - self._min)
-            self.update()
             self.valueChanged.emit(newi)
 
     def mouseReleaseEvent(self, e):
@@ -1060,7 +1068,7 @@ class KnobWidget(QWidget):
         self._user_dragging = False
 
     def wheelEvent(self, e):
-        from PyQt6.QtCore import Qt
+
         step = 1 if e.angleDelta().y() > 0 else -1
         mult = 1 if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 8
         self.setValue(self._value + step * mult)
@@ -1086,13 +1094,12 @@ class SmoothFader(QWidget):
         self._velocity     = 0.0   # momentum
         self._last_drag_y  = None
         self.setMinimumHeight(200)
-        self.setMinimumWidth(50)
+        self.setMinimumWidth(40)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
 
         self._timer = QTimer()
-        self._timer.setInterval(16)  # 60fps
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._step)
-        self._timer.start()
 
     def setRange(self, mn, mx):
         self._min, self._max = mn, mx
@@ -1104,6 +1111,9 @@ class SmoothFader(QWidget):
         self._value = v
         if not animate or self._dragging:
             self._display_val = float(v)
+        else:
+            if not self._timer.isActive():
+                self._timer.start()
         self.valueChanged.emit(v)
         self.update()
 
@@ -1112,31 +1122,29 @@ class SmoothFader(QWidget):
 
     def _step(self):
         if self._dragging:
-            target = float(self._value)
+            self._timer.stop()
+            return
+        target = float(self._value)
+        diff = target - self._display_val
+        if abs(diff) > 0.5:
+            self._display_val += diff * 0.6
+            self._velocity = 0.0
+            self.update()
+        elif abs(diff) > 0.01:
             self._display_val = target
             self._velocity = 0.0
+            self.update()
+        elif self._display_val != target:
+            self._display_val = target
+            self._velocity = 0.0
+            self.update()
         else:
-            target = float(self._value)
-            diff = target - self._display_val
-            if abs(diff) > 0.5:
-                self._display_val += diff * 0.4
-                self._velocity = 0.0
-                self.update()
-            elif abs(diff) > 0.05:
-                self._display_val += diff * 0.3
-                self._velocity = 0.0
-                self.update()
-            elif self._display_val != target:
-                self._display_val = target
-                self._velocity = 0.0
-                self.update()
+            self._timer.stop()
 
     def _frac(self):
         return (self._display_val - self._min) / max(1, self._max - self._min)
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QColor, QPen, QLinearGradient
-        from PyQt6.QtCore import Qt, QRectF
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
@@ -1144,7 +1152,7 @@ class SmoothFader(QWidget):
         track_w = 8
         frac = self._frac()
         fill_h = int(h * frac)
-        handle_w, handle_h = 50, 24
+        handle_w, handle_h = 22, 22
         half_h = handle_h // 2
         # Clamp so handle never clips outside widget bounds
         hy = int(h * (1.0 - frac))
@@ -1171,16 +1179,17 @@ class SmoothFader(QWidget):
         border_color = "#c040c0" if self._dragging else "#9955cc"
         p.setBrush(QColor(handle_color))
         p.setPen(QPen(QColor(border_color), 2))
-        p.drawRoundedRect(hx, hy - handle_h//2, handle_w, handle_h, 6, 6)
+        p.drawRoundedRect(hx, hy - handle_h//2, handle_w, handle_h, 4, 4)
 
         # Grip lines — 3 horizontal notches across centre
         line_color = QColor("#ffffff" if self._dragging else "#9988cc")
         line_color.setAlpha(160)
         p.setPen(QPen(line_color, 1))
         cx = hx + handle_w // 2
-        for offset in (-4, 0, 4):
-            ly = hy + offset
-            p.drawLine(cx - 12, ly, cx + 12, ly)
+        cy = hy
+        for offset in (-3, 0, 3):
+            lx = cx + offset
+            p.drawLine(lx, cy - 6, lx, cy + 6)
 
         p.end()
 
@@ -1198,18 +1207,20 @@ class SmoothFader(QWidget):
         dy = self._drag_y - e.globalPosition().y()  # up = increase
         sensitivity = (self._max - self._min) / max(self.height(), 1)
         new_val = self._drag_base + dy * sensitivity
-        new_val = max(self._min, min(self._max, new_val))
+        new_val = max(float(self._min), min(float(self._max), new_val))
         # Capture velocity for momentum — averaged for smoothness
         if self._last_drag_y is not None:
             raw_vel = (self._last_drag_y - e.globalPosition().y()) * sensitivity
-            self._velocity = self._velocity * 0.6 + raw_vel * 0.4  # smooth velocity
+            self._velocity = self._velocity * 0.6 + raw_vel * 0.4
         self._last_drag_y = e.globalPosition().y()
+        # Update display from float for smooth visual
+        self._display_val = new_val
+        self.update()
+        # Only emit integer value change for device commands
         int_val = round(new_val)
         if int_val != self._value:
             self._value = int_val
-            self._display_val = float(int_val)
             self.valueChanged.emit(int_val)
-        self.update()
 
     def mouseReleaseEvent(self, e):
         self._dragging = False
@@ -1217,7 +1228,7 @@ class SmoothFader(QWidget):
         self._velocity = max(-50, min(50, self._velocity))
 
     def wheelEvent(self, e):
-        from PyQt6.QtCore import Qt
+
         step = 8 if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 32
         direction = 1 if e.angleDelta().y() > 0 else -1
         self.setValue(self._value + direction * step)
@@ -1249,7 +1260,6 @@ class HorizontalFader(QWidget):
         self._timer = QTimer()
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._step)
-        self._timer.start()
 
     def setRange(self, mn, mx):
         self._min, self._max = mn, mx
@@ -1261,6 +1271,9 @@ class HorizontalFader(QWidget):
         self._value = v
         if not animate or self._dragging:
             self._display_val = float(v)
+        else:
+            if not self._timer.isActive():
+                self._timer.start()
         self.valueChanged.emit(v)
         self.update()
 
@@ -1269,31 +1282,30 @@ class HorizontalFader(QWidget):
 
     def _step(self):
         if self._dragging:
-            self._display_val = float(self._value)
+            self._timer.stop()
+            return
+        target = float(self._value)
+        diff = target - self._display_val
+        if abs(diff) > 0.3:
+            self._velocity += diff * 0.05
+            self._velocity *= 0.82
+            self._display_val += self._velocity
+            self.update()
+        elif abs(diff) > 0.05:
+            self._display_val += diff * 0.08
             self._velocity = 0.0
+            self.update()
+        elif self._display_val != target:
+            self._display_val = target
+            self._velocity = 0.0
+            self.update()
         else:
-            target = float(self._value)
-            diff = target - self._display_val
-            if abs(diff) > 0.3:
-                self._velocity += diff * 0.05
-                self._velocity *= 0.82
-                self._display_val += self._velocity
-                self.update()
-            elif abs(diff) > 0.05:
-                self._display_val += diff * 0.08
-                self._velocity = 0.0
-                self.update()
-            elif self._display_val != target:
-                self._display_val = target
-                self._velocity = 0.0
-                self.update()
+            self._timer.stop()
 
     def _frac(self):
         return (self._display_val - self._min) / max(1, self._max - self._min)
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QColor, QPen, QLinearGradient
-        from PyQt6.QtCore import Qt, QRectF
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
@@ -1359,24 +1371,26 @@ class HorizontalFader(QWidget):
         dx = e.globalPosition().x() - self._drag_x  # right = increase
         sensitivity = (self._max - self._min) / max(self.width(), 1)
         new_val = self._drag_base + dx * sensitivity
-        new_val = max(self._min, min(self._max, new_val))
+        new_val = max(float(self._min), min(float(self._max), new_val))
         if self._last_drag_x is not None:
             raw_vel = (e.globalPosition().x() - self._last_drag_x) * sensitivity
             self._velocity = self._velocity * 0.6 + raw_vel * 0.4
         self._last_drag_x = e.globalPosition().x()
+        # Update display from float for smooth visual
+        self._display_val = new_val
+        self.update()
+        # Only emit integer value change for device commands
         int_val = round(new_val)
         if int_val != self._value:
             self._value = int_val
-            self._display_val = float(int_val)
             self.valueChanged.emit(int_val)
-        self.update()
 
     def mouseReleaseEvent(self, e):
         self._dragging = False
         self._velocity = max(-50, min(50, self._velocity))
 
     def wheelEvent(self, e):
-        from PyQt6.QtCore import Qt
+
         step = 8 if (e.modifiers() & Qt.KeyboardModifier.ShiftModifier) else 32
         direction = 1 if e.angleDelta().x() or e.angleDelta().y() > 0 else -1
         if e.angleDelta().y() != 0:
@@ -1455,7 +1469,7 @@ class PoofOverlay(QWidget):
         self.update()
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QColor
+
         from PyQt6.QtCore import Qt, QPointF
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1506,7 +1520,7 @@ class SparkleRing(QWidget):
         self.update()
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QColor, QPen
+
         from PyQt6.QtCore import Qt, QPointF
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1539,48 +1553,52 @@ class ModBar(QWidget):
         self._max = PARAM_RANGE
         self._active = False
         self._history = []
-        self._history_len = 120  # ~12s at 100ms poll
+        self._history_len = 600  # longer time window — slower scroll
         self._display_val = 0.0  # smoothed current value
         self._target_val = 0.0
-        self.setFixedHeight(70)
+        self.setFixedHeight(40)
         self.setMinimumWidth(10)
 
-        # Smooth render timer — 60fps interpolation
+        # Smooth render timer — only active when animating
         self._render_timer = QTimer()
         self._render_timer.setInterval(16)
         self._render_timer.timeout.connect(self._interpolate)
-        self._render_timer.start()
 
     def setValue(self, v: int):
         v = max(0, min(self._max, v))
         self._target_val = float(v)
-        # Record interpolated display value, not raw sample
-        self._history.append(self._display_val)
-        if len(self._history) > self._history_len:
-            self._history = self._history[-self._history_len:]
+        if self._active and not self._render_timer.isActive():
+            self._render_timer.start()
 
     def _interpolate(self):
         if not self._active:
+            self._render_timer.stop()
             return
         diff = self._target_val - self._display_val
-        if abs(diff) > 0.5:
-            self._display_val += diff * 0.3
-            self.update()
+        if abs(diff) > 0.1:
+            self._display_val += diff * 0.1
         elif abs(diff) > 0.01:
             self._display_val = self._target_val
-            self.update()
+        # Record interpolated value every frame for smooth waveform
+        self._history.append(self._display_val)
+        if len(self._history) > self._history_len:
+            self._history = self._history[-self._history_len:]
+        self.update()
 
     def setActive(self, active: bool):
         self._active = active
         if not active:
+            self._render_timer.stop()
             self._history.clear()
             self._display_val = 0.0
             self._target_val = 0.0
+        elif not self._render_timer.isActive():
+            self._render_timer.start()
         self.update()
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QColor, QPen, QPainterPath
-        from PyQt6.QtCore import Qt
+
+
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
@@ -1680,7 +1698,7 @@ class ChannelCard(QWidget):
         """)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(6, 6, 6, 4)
+        root.setContentsMargins(6, 4, 6, 4)
         root.setSpacing(3)
         root.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -1689,10 +1707,11 @@ class ChannelCard(QWidget):
         top_hdr.setSpacing(4)
         top_hdr.addStretch(1)
 
+        _title_fs = "17px" if (index + 1) <= 6 else "11px"
         self._num_lbl = QLabel(f"{index+1}")
         self._num_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._num_lbl.setStyleSheet(
-            f"color:#ffffff;font-weight:bold;font-size:20px;"
+            f"color:#ffffff;font-weight:bold;font-size:{_title_fs};"
             f"background:transparent;border:none;"
         )
         top_hdr.addWidget(self._num_lbl)
@@ -1700,7 +1719,7 @@ class ChannelCard(QWidget):
         self._param_name_lbl = QLabel("")
         self._param_name_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
         self._param_name_lbl.setStyleSheet(
-            f"color:#ffffff;font-size:20px;font-weight:bold;letter-spacing:1px;"
+            f"color:#ffffff;font-size:{_title_fs};font-weight:bold;letter-spacing:1px;"
             f"background:transparent;border:none;"
         )
         self._param_name_lbl.setVisible(False)
@@ -1805,13 +1824,17 @@ class ChannelCard(QWidget):
             knob_row.setContentsMargins(0, 0, 0, 0)
             knob_row.setSpacing(4)
             knob_row.addStretch(1)
-            knob_row.addSpacing(22)
-            self.knob = KnobWidget(size=54)
+            _knob_spacer = QLabel("")
+            _knob_spacer.setFixedWidth(36)
+            _knob_spacer.setStyleSheet("background:transparent;border:none;")
+            knob_row.addWidget(_knob_spacer)
+            self.knob = KnobWidget(size=46)
             self.knob.setRange(0, PARAM_RANGE)
             self.knob.setValue(0)
             self.knob.valueChanged.connect(self._on_knob)
             knob_row.addWidget(self.knob)
             self.val_lbl = QLabel("0%")
+            self.val_lbl.setFixedWidth(36)
             self.val_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             self.val_lbl.setStyleSheet(
                 f"color:{TEXT_DIM};font-size:12px;"
@@ -1835,7 +1858,7 @@ class ChannelCard(QWidget):
                 col = QVBoxLayout()
                 col.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 col.setSpacing(3)
-                mini = KnobWidget(size=42)
+                mini = KnobWidget(size=32)
                 mini.setRange(0, PARAM_RANGE)
                 mini.setValue(0)
                 _field = field
@@ -1855,7 +1878,7 @@ class ChannelCard(QWidget):
             root.addLayout(tss_row)
 
             # LFO operator dropdown at the very bottom
-            root.addSpacing(2)
+            root.addSpacing(8)
             self.op_combo.setVisible(True)
             self.op_combo.setFixedHeight(26)
             self.op_combo.setMaximumWidth(180)
@@ -1875,9 +1898,10 @@ class ChannelCard(QWidget):
             root.addLayout(lfo_row2)
 
             # Live modulation output bar
-            root.addSpacing(2)
+            root.addSpacing(6)
             self._out_bar = ModBar()
-            self._out_bar.setFixedWidth(216)
+            self._out_bar.setFixedWidth(190)
+            self._out_bar.setFixedHeight(70)
             bar_row = QHBoxLayout()
             bar_row.addStretch(1)
             bar_row.addWidget(self._out_bar)
@@ -1897,7 +1921,7 @@ class ChannelCard(QWidget):
             col = QVBoxLayout()
             col.setAlignment(Qt.AlignmentFlag.AlignCenter)
             col.setSpacing(2)
-            mini = KnobWidget(size=36)
+            mini = KnobWidget(size=24)
             mini.setRange(0, PARAM_RANGE)
             mini.setValue(0)
             _field = field
@@ -1938,7 +1962,8 @@ class ChannelCard(QWidget):
         # Live modulation output bar
         root.addSpacing(2)
         self._out_bar = ModBar()
-        self._out_bar.setFixedWidth(216)
+        self._out_bar.setFixedWidth(140)
+        self._out_bar.setFixedHeight(35)
         bar_row2 = QHBoxLayout()
         bar_row2.addStretch(1)
         bar_row2.addWidget(self._out_bar)
@@ -1969,19 +1994,7 @@ class ChannelCard(QWidget):
             self._param_name_lbl.setVisible(False)
 
     def _format_value(self, raw: int) -> str:
-        """Format a raw 0-1023 value using parameter info."""
-        # If we have named values/enum, show the step name
-        if self._param_values:
-            n = len(self._param_values)
-            idx = min(int(raw / 1023 * n), n - 1) if n > 0 else 0
-            return str(self._param_values[idx])
-        # If stepped, show step number
-        if self._param_step and self._param_max > self._param_min:
-            steps = (self._param_max - self._param_min) // self._param_step
-            if steps > 0:
-                step_val = self._param_min + round(raw / 1023 * steps) * self._param_step
-                return str(int(step_val))
-        # Default: percentage
+        """Format a raw 0-1023 value — always smooth 0-100%."""
         return f"{round(raw / 10.23)}%"
 
     def set_manual(self, value: int, silent: bool = True):
@@ -1992,12 +2005,16 @@ class ChannelCard(QWidget):
             self.toggle.setChecked(on)
             self.toggle.setText("ON" if on else "OFF")
         elif self.knob:
+            if self.knob._user_dragging:
+                self._updating = False
+                return  # never touch knob during active drag
+            self.knob.blockSignals(silent)
             self.knob.setValue(value)
+            self.knob.blockSignals(False)
             if self.val_lbl:
                 self.val_lbl.setText(pct)
         elif self.slider:
             if hasattr(self.slider, 'setValue') and hasattr(self.slider, '_display_val'):
-                # SmoothFader — animate from polls
                 self.slider.setValue(value, animate=silent)
             else:
                 self.slider.setValue(value)
@@ -2130,9 +2147,6 @@ class ChannelCard(QWidget):
             return
         if self.val_lbl:
             self.val_lbl.setText(self._format_value(value))
-        # Mark as user drag so knob doesn't smooth away from position
-        if self.knob:
-            self.knob._display_frac = self.knob._frac
         if self.on_manual_change:
             self.on_manual_change(self.index, value)
 
@@ -2181,21 +2195,21 @@ class ParametersTab(QWidget):
             f"QWidget{{background:{SURFACE};border:1px solid {BORDER};border-radius:6px;}}"
         )
         tl = QHBoxLayout(transport_grp)
-        tl.setContentsMargins(14, 8, 14, 8)
-        tl.setSpacing(12)
+        tl.setContentsMargins(12, 8, 12, 8)
+        tl.setSpacing(6)
 
         transport_title = QLabel("TRANSPORT")
         transport_title.setStyleSheet(
-            f"color:#ffffff;font-size:15px;font-weight:bold;letter-spacing:2px;"
+            f"color:#ffffff;font-size:12px;font-weight:bold;letter-spacing:2px;"
             f"background:transparent;border:none;"
         )
         tl.addWidget(transport_title)
 
-        tl.addSpacing(8)
+        tl.addSpacing(4)
 
         self.tap_btn = QPushButton("◉  TAP")
         self.tap_btn.setEnabled(False)
-        self.tap_btn.setFixedHeight(32)
+        self.tap_btn.setFixedHeight(30)
         self._tap_base_style = (
             f"QPushButton{{background:{SURFACE2};border:2px solid {BORDER};"
             f"border-radius:4px;color:{TEXT};font-weight:bold;padding:7px 18px;}}"
@@ -2205,7 +2219,7 @@ class ParametersTab(QWidget):
         self.tap_btn.clicked.connect(lambda: self._transport("tap"))
         tl.addWidget(self.tap_btn)
 
-        tl.addSpacing(12)
+        tl.addSpacing(6)
 
         bpm_lbl = QLabel("BPM")
         bpm_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;background:transparent;border:none;")
@@ -2214,37 +2228,37 @@ class ParametersTab(QWidget):
         self.bpm_slider = HorizontalFader()
         self.bpm_slider.setRange(2000, 30000)   # 20.00 – 300.00 BPM ×100
         self.bpm_slider.setValue(12000)
-        self.bpm_slider.setFixedWidth(200)
+        self.bpm_slider.setFixedWidth(140)
         self.bpm_slider.setEnabled(False)
         self.bpm_slider.valueChanged.connect(self._on_bpm_slider)
         tl.addWidget(self.bpm_slider)
 
         self.bpm_display = QLabel("120.0")
         self.bpm_display.setStyleSheet(
-            f"color:#ffffff;font-size:20px;font-weight:bold;min-width:70px;"
+            f"color:#ffffff;font-size:14px;font-weight:bold;min-width:50px;"
             f"background:transparent;border:none;"
         )
         tl.addWidget(self.bpm_display)
 
-        tl.addSpacing(12)
+        tl.addSpacing(6)
 
         self.stop_btn = QPushButton("◼  STOP")
         self.stop_btn.setEnabled(False)
-        self.stop_btn.setFixedHeight(32)
+        self.stop_btn.setFixedHeight(30)
         self.stop_btn.clicked.connect(lambda: self._transport("stop"))
         tl.addWidget(self.stop_btn)
 
         self.start_btn = QPushButton("▶  PLAY")
         self.start_btn.setObjectName("primary")
         self.start_btn.setEnabled(False)
-        self.start_btn.setFixedHeight(32)
+        self.start_btn.setFixedHeight(30)
         self.start_btn.clicked.connect(lambda: self._transport("start"))
         tl.addWidget(self.start_btn)
 
         tl.addStretch()
 
         root.addWidget(transport_grp)
-        root.addSpacing(12)
+        root.addSpacing(4)
 
         # ── Motion panel ──────────────────────────────────────────
         # Per manual: P1-P11 are parameter knobs, P12 is crossfader
@@ -2264,16 +2278,16 @@ class ParametersTab(QWidget):
 
         # P1-P6 parameter knobs — 3+3 grid matching front panel
         knobs_grid = QGridLayout()
-        knobs_grid.setHorizontalSpacing(10)
-        knobs_grid.setVerticalSpacing(14)
+        knobs_grid.setHorizontalSpacing(6)
+        knobs_grid.setVerticalSpacing(6)
         for col in range(3):
             knobs_grid.setColumnStretch(col, 1)
         knobs_grid.setRowStretch(0, 1)
         knobs_grid.setRowStretch(1, 1)
         for i in range(6):
             card = ChannelCard(i)
-            card.setMinimumHeight(320)
-            card.setMaximumHeight(500)
+            card.setMinimumHeight(200)
+            card.setMaximumHeight(380)
             card.on_manual_change = self._manual_changed
             card.on_mod_change    = self._mod_changed
             self.channels.append(card)
@@ -2283,26 +2297,26 @@ class ParametersTab(QWidget):
 
         # Right: P12 vertical fader — narrow, full height of knobs row
         fader_widget = QWidget()
-        fader_widget.setMaximumWidth(160)
+        fader_widget.setMaximumWidth(118)
         fader_widget.setStyleSheet(f"""
             QWidget {{
                 background:{SURFACE};
                 border:1px solid {BORDER};
-                border-radius:8px;
+                border-radius:12px;
             }}
         """)
         fader_v = QVBoxLayout(fader_widget)
-        fader_v.setContentsMargins(4, 8, 4, 8)
+        fader_v.setContentsMargins(8, 8, 8, 8)
         fader_v.setSpacing(4)
 
         self._p12_name_lbl = QLabel("")
         self._p12_name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._p12_name_lbl.setStyleSheet(
-            f"color:#ffffff;font-size:20px;font-weight:bold;letter-spacing:1px;"
+            f"color:#ffffff;font-size:13px;font-weight:bold;letter-spacing:1px;"
             f"background:transparent;border:none;"
         )
         fader_v.addWidget(self._p12_name_lbl)
-        fader_v.addSpacing(6)
+        fader_v.addSpacing(2)
 
         # Create P12 ChannelCard but use its slider vertically
         card12 = ChannelCard(11)
@@ -2320,12 +2334,12 @@ class ParametersTab(QWidget):
             card12.slider = vert_slider
             fader_v.addWidget(vert_slider, stretch=1,
                               alignment=Qt.AlignmentFlag.AlignHCenter)
-        fader_v.addSpacing(16)
+        fader_v.addSpacing(6)
 
         self.val_lbl_12 = QLabel("0%")
         self.val_lbl_12.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.val_lbl_12.setStyleSheet(
-            f"color:#ffffff;font-size:16px;font-weight:bold;"
+            f"color:#ffffff;font-size:12px;font-weight:bold;"
             f"background:transparent;border:none;"
         )
         fader_v.addWidget(self.val_lbl_12)
@@ -2347,7 +2361,7 @@ class ParametersTab(QWidget):
             col12 = QVBoxLayout()
             col12.setAlignment(Qt.AlignmentFlag.AlignCenter)
             col12.setSpacing(2)
-            mini12 = KnobWidget(size=32)
+            mini12 = KnobWidget(size=28)
             mini12.setRange(0, PARAM_RANGE)
             mini12.setValue(0)
             _f = field
@@ -2388,8 +2402,8 @@ class ParametersTab(QWidget):
         # LFO waveform for P12
         fader_v.addSpacing(2)
         card12._out_bar = ModBar()
-        card12._out_bar.setFixedWidth(140)
-        card12._out_bar.setMinimumHeight(70)
+        card12._out_bar.setFixedWidth(90)
+        card12._out_bar.setMinimumHeight(40)
         fader_v.addWidget(card12._out_bar, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         # Wrap fader in a column that extends 80px below the knobs row
@@ -2397,7 +2411,7 @@ class ParametersTab(QWidget):
         fader_col.addWidget(fader_widget, stretch=1)
         top_row.addLayout(fader_col, stretch=1)
         panel_v.addLayout(top_row, stretch=1)
-        panel_v.addSpacing(8)
+        panel_v.addSpacing(4)
 
         # P7-P11 switches — full width to edges
         sw_container = QWidget()
@@ -2414,8 +2428,8 @@ class ParametersTab(QWidget):
         sw_inner.setSpacing(6)
         for i in range(6, 11):
             card = ChannelCard(i)
-            card.setMinimumHeight(220)
-            card.setMaximumHeight(330)
+            card.setMinimumHeight(180)
+            card.setMaximumHeight(280)
             card.setStyleSheet("QWidget { background: transparent; border: none; }")
             card.on_manual_change = self._manual_changed
             card.on_mod_change    = self._mod_changed
@@ -2424,7 +2438,8 @@ class ParametersTab(QWidget):
             if i < 10:
                 div = QFrame()
                 div.setFrameShape(QFrame.Shape.VLine)
-                div.setStyleSheet(f"background:{BORDER};max-width:1px;border:none;")
+                div.setStyleSheet(f"background:{BORDER};max-width:1px;border:none;min-height:0px;")
+                div.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
                 sw_inner.addWidget(div)
         panel_v.addWidget(sw_container, stretch=0)
 
@@ -2483,8 +2498,12 @@ class ParametersTab(QWidget):
             self.channels[ch].set_tss(t, sp, sl, silent=True)
 
     def apply_state(self, m: list, t: list, sp: list, sl: list, sr: list):
-        """Apply full state including TSS panel for all 12 channels."""
+        """Apply full state including TSS panel — skip recently edited channels."""
+        now = __import__('time').monotonic()
         for i in range(min(12, len(m))):
+            last_edit = self._last_sent.get(f"edit_time_{i}", 0)
+            if now - last_edit < 3.0:
+                continue
             card = self.channels[i]
             card.set_manual(m[i] if i < len(m) else 512)
             card.set_operator(sr[i] if i < len(sr) else 0)
@@ -2502,7 +2521,7 @@ class ParametersTab(QWidget):
             # Skip channels edited within the last 0.6 seconds
             # BUT always update toggle switches (device state is authoritative)
             last_edit = self._last_sent.get(f"edit_time_{i}", 0)
-            recently_edited = now - last_edit < 0.6
+            recently_edited = now - last_edit < 3.0
             m = mod.get("m", 512)
             if card._is_toggle:
                 # Always sync toggle state from device
@@ -3849,8 +3868,8 @@ class VideomancerApp(QMainWindow):
         if self._window_label:
             title += f" {self._window_label}"
         self.setWindowTitle(title)
-        self.resize(1280, 1080)
-        self.setMinimumSize(1050, 960)
+        self.resize(820, 1020)
+        self.setMinimumSize(700, 860)
         self.setStyleSheet(STYLESHEET)
 
         self._worker: Optional[SerialWorker] = None
@@ -3971,8 +3990,8 @@ class VideomancerApp(QMainWindow):
 
         # Active program label as corner widget of tab bar
         self.conn_bar._prog_lbl.setStyleSheet(
-            f"color:#ffffff;font-size:17px;font-weight:bold;letter-spacing:2px;"
-            f"background:transparent;border:none;padding:10px 12px 6px 12px;"
+            f"color:#ffffff;font-size:15px;font-weight:bold;letter-spacing:1px;"
+            f"background:transparent;border:none;padding:11px 8px 0px 8px;"
         )
         self.conn_bar._prog_lbl.setVisible(False)
         self.tabs.setCornerWidget(self.conn_bar._prog_lbl, Qt.Corner.TopRightCorner)
@@ -4041,17 +4060,17 @@ class VideomancerApp(QMainWindow):
     def _build_header(self):
         w = QWidget()
         w.setStyleSheet(f"background:{BG};")
-        w.setFixedHeight(52)
+        w.setFixedHeight(38)
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(14, 0, 12, 0)
-        lay.setSpacing(10)
+        lay.setContentsMargins(8, 0, 8, 0)
+        lay.setSpacing(6)
 
         # Title — left aligned
-        logo_lbl = QLabel('VIDEOMANCER <span style="font-size:16px;">— Control Interface</span>')
+        logo_lbl = QLabel('VIDEOMANCER <span style="font-size:16px;">— Control</span>')
         logo_lbl.setStyleSheet(
             "background:transparent;border:none;color:#ffffff;"
             "font-family:'Goldplay',sans-serif;"
-            "font-size:28px;font-weight:900;letter-spacing:4px;"
+            "font-size:24px;font-weight:900;letter-spacing:2px;"
         )
         lay.addWidget(logo_lbl)
 
@@ -4060,12 +4079,12 @@ class VideomancerApp(QMainWindow):
         # Dual Cast — toggle a second window
         self._dual_btn = QPushButton("Dual Cast")
         self._dual_btn.setCheckable(True)
-        self._dual_btn.setFixedHeight(32)
+        self._dual_btn.setFixedHeight(24)
         self._dual_btn.setStyleSheet(f"""
             QPushButton {{
-                background:{SURFACE2}; border:2px solid {BORDER};
-                border-radius:5px; color:{TEXT_DIM};
-                font-size:13px; font-weight:bold; padding:2px 14px;
+                background:{SURFACE2}; border:1px solid {BORDER};
+                border-radius:3px; color:{TEXT_DIM};
+                font-size:10px; font-weight:bold; padding:2px 8px;
             }}
             QPushButton:checked {{
                 background:#7c3aed; border:2px solid #ffffff;
@@ -4078,13 +4097,13 @@ class VideomancerApp(QMainWindow):
 
         # Update available banner (hidden until check completes)
         self._update_btn = QPushButton("")
-        self._update_btn.setFixedHeight(28)
+        self._update_btn.setFixedHeight(22)
         self._update_btn.setVisible(False)
         self._update_btn.setStyleSheet(f"""
             QPushButton {{
                 background:#2d1f5e; border:1px solid {ACCENT};
-                border-radius:4px; color:#a78bfa;
-                font-size:12px; font-weight:bold; padding:2px 10px;
+                border-radius:3px; color:#a78bfa;
+                font-size:9px; font-weight:bold; padding:1px 6px;
             }}
             QPushButton:hover {{
                 background:#3d2f7e; color:#ffffff;
@@ -4330,8 +4349,12 @@ class VideomancerApp(QMainWindow):
                         sl = data.get("sl", [512]*12)
                         self.param_tab.apply_state(m, t, sp, sl, sr)
                     else:
-                        # Apply only manual + operator, don't touch TSS
+                        # Apply only manual + operator, skip recently edited
+                        now = __import__('time').monotonic()
                         for i in range(min(12, len(m))):
+                            last_edit = self.param_tab._last_sent.get(f"edit_time_{i}", 0)
+                            if now - last_edit < 3.0:
+                                continue
                             card = self.param_tab.channels[i]
                             card.set_manual(m[i] if i < len(m) else 512)
                             card.set_operator(sr[i] if i < len(sr) else 0)
@@ -4451,7 +4474,7 @@ class VideomancerApp(QMainWindow):
 
     def _update_uptime(self):
         """Update firmware panel with local connection uptime as fallback."""
-        if not hasattr(self, '_connected_at'):
+        if not hasattr(self, '_connected_at') or not self._worker:
             return
         elapsed = int(time.monotonic() - self._connected_at)
         hours, rem = divmod(elapsed, 3600)
@@ -4568,8 +4591,6 @@ class VideomancerApp(QMainWindow):
     def _on_edit_cooldown(self):
         """Called after user stops editing — safe to sync from device again."""
         self._user_editing = False
-        # Fetch TSS readback to sync sliders after edit settles
-        QTimer.singleShot(200, self._fetch_tss_readback_auto)
 
     def _poll_device(self):
         """Poll device state for bidirectional sync every 250ms.
@@ -4712,7 +4733,13 @@ class VideomancerApp(QMainWindow):
 
         self.state_tab.set_snapshot_status(f"Restoring: loading {program}…")
 
+        def _abort_restore(msg="Restore aborted — device disconnected"):
+            self.state_tab.set_snapshot_status(msg)
+            self.state_tab._restore_btn.setEnabled(True)
+
         def step2():
+            if not self._worker:
+                return _abort_restore()
             if parameters:
                 m_str  = ",".join(str(v) for v in parameters)
                 t_str  = ",".join("512" for _ in range(12))
@@ -4731,7 +4758,8 @@ class VideomancerApp(QMainWindow):
             QTimer.singleShot(400, step3)
 
         def step3():
-            # Recreate user presets
+            if not self._worker:
+                return _abort_restore()
             user = presets.get("user", [])
             for i, p in enumerate(user):
                 name  = p.get("n", f"preset_{i}")
@@ -4745,6 +4773,8 @@ class VideomancerApp(QMainWindow):
             QTimer.singleShot(600, step4)
 
         def step4():
+            if not self._worker:
+                return _abort_restore()
             if settings:
                 self._worker.send(
                     f"settings import {json.dumps(settings, separators=(',', ':'))}"
@@ -4756,7 +4786,8 @@ class VideomancerApp(QMainWindow):
             self.state_tab._restore_btn.setEnabled(True)
             self.status_bar.showMessage("Snapshot restored", 4000)
             QTimer.singleShot(4000, lambda: self.state_tab.set_snapshot_status(""))
-            self._fetch_presets()
+            if self._worker:
+                self._fetch_presets()
 
         # Load program first, then chain the rest
         if program:
@@ -4817,6 +4848,16 @@ class VideomancerApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        # Stop all timers first to prevent callbacks firing during teardown
+        self._poll_timer.stop()
+        self._edit_cooldown.stop()
+        if hasattr(self, '_hotplug_timer'):
+            self._hotplug_timer.stop()
+        if hasattr(self, '_uptime_timer'):
+            self._uptime_timer.stop()
+        if hasattr(self, '_update_checker') and self._update_checker.isRunning():
+            self._update_checker.quit()
+            self._update_checker.wait(1000)
         if self._worker:
             self._worker.disconnect_port()
             self._worker.wait(2000)
