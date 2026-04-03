@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "1.4"
+APP_VERSION = "2.0"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -964,7 +964,12 @@ class KnobWidget(QWidget):
         self._value = v
         new_frac = (v - self._min) / max(1, self._max - self._min)
         self._frac = new_frac
-        self._display_frac = new_frac
+        if not animate:
+            self._display_frac = new_frac
+        # When animate=True, _frac is set but _display_frac is NOT —
+        # _smooth_step will glide _display_frac toward _frac.
+        if not self._smooth_timer.isActive():
+            self._smooth_timer.start()
         self.update()
         self.valueChanged.emit(v)
 
@@ -978,13 +983,16 @@ class KnobWidget(QWidget):
             self._smooth_timer.stop()
             return
         diff = self._frac - self._display_frac
+        glide = 0.15
         if abs(diff) > 0.001:
-            self._display_frac += diff * 0.4
+            self._display_frac += diff * glide
             self.update()
         elif self._display_frac != self._frac:
             self._display_frac = self._frac
+            self._tss_glide = False
             self.update()
         else:
+            self._tss_glide = False
             self._smooth_timer.stop()  # settled — stop until needed
 
     def setRange(self, mn, mx):
@@ -1004,6 +1012,7 @@ class KnobWidget(QWidget):
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
         # Body
         p.setPen(QPen(QColor(BORDER), max(1, s * 0.03)))
@@ -1015,17 +1024,23 @@ class KnobWidget(QWidget):
         qt_start = 225 * 16   # 7 o'clock in Qt coords
         qt_span  = 270 * 16
 
-        # Track
+        # Track (sub-pixel QPainterPath)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(BORDER), arc_w,
                       Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawArc(rect, qt_start, -qt_span)
+        track_path = QPainterPath()
+        track_path.arcMoveTo(rect, 225.0)
+        track_path.arcTo(rect, 225.0, -270.0)
+        p.drawPath(track_path)
 
-        # Value arc
+        # Value arc (sub-pixel QPainterPath)
         if frac > 0.001:
             p.setPen(QPen(QColor(ACCENT), arc_w,
                           Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            p.drawArc(rect, qt_start, -int(frac * qt_span))
+            val_path = QPainterPath()
+            val_path.arcMoveTo(rect, 225.0)
+            val_path.arcTo(rect, 225.0, -frac * 270.0)
+            p.drawPath(val_path)
 
         # Dot — exact arc tip: angle = 225 - frac*270 in standard math degrees
         a  = math.radians(225.0 - frac * 270.0)
@@ -1147,49 +1162,50 @@ class SmoothFader(QWidget):
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        track_x = w // 2
-        track_w = 8
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        w, h = float(self.width()), float(self.height())
+        track_x = w * 0.5
+        track_w = 8.0
         frac = self._frac()
-        fill_h = int(h * frac)
-        handle_w, handle_h = 22, 22
-        half_h = handle_h // 2
+        fill_h = h * frac
+        handle_w, handle_h = 22.0, 22.0
+        half_h = handle_h * 0.5
         # Clamp so handle never clips outside widget bounds
-        hy = int(h * (1.0 - frac))
+        hy = h * (1.0 - frac)
         hy = max(half_h, min(h - half_h, hy))
-        hx = track_x - handle_w // 2
+        hx = track_x - handle_w * 0.5
 
         # Dark "off" track above handle
-        off_h = max(0, hy - half_h)
+        off_h = max(0.0, hy - half_h)
         if off_h > 0:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor("#0d0b1e"))
-            p.drawRoundedRect(track_x - track_w//2, 0, track_w, off_h, 4, 4)
+            p.drawRoundedRect(QRectF(track_x - track_w * 0.5, 0.0, track_w, off_h), 4.0, 4.0)
 
         # Filled track below handle
         if fill_h > 0:
-            grad = QLinearGradient(0, h, 0, h - fill_h)
+            grad = QLinearGradient(0.0, h, 0.0, h - fill_h)
             grad.setColorAt(0, QColor("#7733bb"))
             grad.setColorAt(1, QColor("#c040c0"))
             p.setBrush(grad)
-            p.drawRoundedRect(track_x - track_w//2, h - fill_h, track_w, fill_h, 4, 4)
+            p.drawRoundedRect(QRectF(track_x - track_w * 0.5, h - fill_h, track_w, fill_h), 4.0, 4.0)
 
         # Handle body
         handle_color = "#c040c0" if self._dragging else "#7733bb"
         border_color = "#c040c0" if self._dragging else "#9955cc"
         p.setBrush(QColor(handle_color))
         p.setPen(QPen(QColor(border_color), 2))
-        p.drawRoundedRect(hx, hy - handle_h//2, handle_w, handle_h, 4, 4)
+        p.drawRoundedRect(QRectF(hx, hy - half_h, handle_w, handle_h), 4.0, 4.0)
 
         # Grip lines — 3 horizontal notches across centre
         line_color = QColor("#ffffff" if self._dragging else "#9988cc")
         line_color.setAlpha(160)
         p.setPen(QPen(line_color, 1))
-        cx = hx + handle_w // 2
+        cx = hx + handle_w * 0.5
         cy = hy
-        for offset in (-3, 0, 3):
+        for offset in (-3.0, 0.0, 3.0):
             lx = cx + offset
-            p.drawLine(lx, cy - 6, lx, cy + 6)
+            p.drawLine(QPointF(lx, cy - 6.0), QPointF(lx, cy + 6.0))
 
         p.end()
 
@@ -2001,7 +2017,7 @@ class ChannelCard(QWidget):
         self._updating = silent
         pct = self._format_value(value)
         if self._is_toggle:
-            on = value >= 512
+            on = value > 0
             self.toggle.setChecked(on)
             self.toggle.setText("ON" if on else "OFF")
         elif self.knob:
@@ -2057,9 +2073,18 @@ class ChannelCard(QWidget):
         if not self._tss_sliders:
             return
         self._updating = silent
-        self._tss_sliders[0].setValue(t, animate=False)
-        self._tss_sliders[1].setValue(sp, animate=False)
-        self._tss_sliders[2].setValue(sl, animate=False)
+        for knob, val in zip(self._tss_sliders, (t, sp, sl)):
+            if knob._user_dragging:
+                continue
+            val = max(knob._min, min(knob._max, int(val)))
+            if val == knob._value:
+                continue
+            knob._value = val
+            knob._frac = (val - knob._min) / max(1, knob._max - knob._min)
+            # Use slower glide for TSS — spread over full poll interval
+            knob._tss_glide = True
+            if not knob._smooth_timer.isActive():
+                knob._smooth_timer.start()
         self._updating = False
 
     def _on_tss(self, field: str, value: int):
@@ -2091,7 +2116,7 @@ class ChannelCard(QWidget):
             return (self._tss_sliders[0].value(),
                     self._tss_sliders[1].value(),
                     self._tss_sliders[2].value())
-        return (512, 512, 512)
+        return (0, 0, 0)
 
     def set_enabled_controls(self, v: bool):
         if self.slider:
@@ -2198,7 +2223,7 @@ class ParametersTab(QWidget):
         tl.setContentsMargins(12, 8, 12, 8)
         tl.setSpacing(6)
 
-        transport_title = QLabel("TRANSPORT")
+        transport_title = QLabel("MOTION")
         transport_title.setStyleSheet(
             f"color:#ffffff;font-size:12px;font-weight:bold;letter-spacing:2px;"
             f"background:transparent;border:none;"
@@ -2505,12 +2530,12 @@ class ParametersTab(QWidget):
             if now - last_edit < 3.0:
                 continue
             card = self.channels[i]
-            card.set_manual(m[i] if i < len(m) else 512)
+            card.set_manual(m[i] if i < len(m) else 0)
             card.set_operator(sr[i] if i < len(sr) else 0)
             self.set_tss_panel(i,
-                t[i]  if i < len(t)  else 512,
-                sp[i] if i < len(sp) else 512,
-                sl[i] if i < len(sl) else 512,
+                t[i]  if i < len(t)  else 0,
+                sp[i] if i < len(sp) else 0,
+                sl[i] if i < len(sl) else 0,
             )
 
     def apply_modulation_status(self, modulators: list):
@@ -3188,24 +3213,24 @@ class SnapshotsTab(QWidget):
 # ── System tab ─────────────────────────────────────────────────────────
 
 def _timing_to_fps(timing: str) -> str:
-    """Convert a timing string like '720p5994' to a human framerate like '59.94 Hz'."""
+    """Convert a timing string like '720p5994' to a human framerate."""
     t = timing.lower().strip()
     table = {
-        "ntsc":       "59.94 Hz  (480i)",
-        "pal":        "50.00 Hz  (576i)",
-        "480p":       "59.94 Hz  (480p)",
-        "576p":       "50.00 Hz  (576p)",
-        "720p50":     "50.00 Hz  (720p)",
-        "720p5994":   "59.94 Hz  (720p)",
-        "720p60":     "60.00 Hz  (720p)",
-        "1080i50":    "50.00 Hz  (1080i)",
-        "1080i5994":  "59.94 Hz  (1080i)",
-        "1080i60":    "60.00 Hz  (1080i)",
-        "1080p2398":  "23.98 Hz  (1080p)",
-        "1080p24":    "24.00 Hz  (1080p)",
-        "1080p25":    "25.00 Hz  (1080p)",
-        "1080p2997":  "29.97 Hz  (1080p)",
-        "1080p30":    "30.00 Hz  (1080p)",
+        "ntsc":       "29.97  (480i)",
+        "pal":        "25  (576i)",
+        "480p":       "59.94  (480p)",
+        "576p":       "50  (576p)",
+        "720p50":     "50  (720p)",
+        "720p5994":   "59.94  (720p)",
+        "720p60":     "60  (720p)",
+        "1080i50":    "25  (1080i)",
+        "1080i5994":  "29.97  (1080i)",
+        "1080i60":    "30  (1080i)",
+        "1080p2398":  "23.98  (1080p)",
+        "1080p24":    "24  (1080p)",
+        "1080p25":    "25  (1080p)",
+        "1080p2997":  "29.97  (1080p)",
+        "1080p30":    "30  (1080p)",
     }
     return table.get(t, f"{timing}")
 
@@ -3437,6 +3462,31 @@ class SystemTab(QWidget):
         ml.addWidget(self.refresh_midi_btn)
         rl.addWidget(midi_grp)
 
+        # ·· Documentation ··
+        docs_grp = QGroupBox("DOCUMENTATION")
+        dl = QVBoxLayout(docs_grp)
+        dl.setSpacing(8)
+
+        self._doc_links = [
+            ("Community", "https://community.lzxindustries.net/"),
+            ("Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
+            ("Technical Manual", "https://docs.lzxindustries.net/docs/instruments/videomancer"),
+        ]
+        for label, url in self._doc_links:
+            btn = QPushButton(f"📖  {label}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(
+                f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
+                f"border-radius:4px;color:{ACCENT};font-size:13px;"
+                f"font-weight:bold;padding:8px 12px;text-align:left;}}"
+                f"QPushButton:hover{{background:{DIM};border-color:{ACCENT};color:#ffffff;}}"
+            )
+            _url = url
+            btn.clicked.connect(lambda checked, u=_url: self._open_doc(u))
+            dl.addWidget(btn)
+
+        rl.addWidget(docs_grp)
+
         rl.addStretch()
         splitter.addWidget(right)
         splitter.setSizes([400, 400])
@@ -3579,6 +3629,11 @@ class SystemTab(QWidget):
         if self.on_send and self._connected:
             self.on_send("version")
 
+    def _open_doc(self, url: str):
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl(url))
+
 
 # ── State tab ──────────────────────────────────────────────────────────
 
@@ -3633,13 +3688,6 @@ class StateTab(QWidget):
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 8, 0)
         ll.setSpacing(10)
-
-        # Factory preset grid (hidden until device sends some)
-        self._factory_grp = QGroupBox("Factory Presets")
-        self._factory_grid = QGridLayout(self._factory_grp)
-        self._factory_grid.setSpacing(6)
-        self._factory_grp.setVisible(False)
-        ll.addWidget(self._factory_grp)
 
         # User presets
         user_grp = QGroupBox("User Presets")
@@ -3737,21 +3785,6 @@ class StateTab(QWidget):
     def populate_presets(self, factory: list, user: list, flash_free: int = 0):
         self._factory = factory
         self._user    = user
-
-        # Rebuild factory grid buttons
-        for i in reversed(range(self._factory_grid.count())):
-            self._factory_grid.itemAt(i).widget().setParent(None)
-
-        cols = 3
-        for i, p in enumerate(factory):
-            name = p.get("n", f"Factory {i}")
-            btn = QPushButton(name)
-            btn.setFixedHeight(38)
-            btn.clicked.connect(lambda checked, idx=i: self._apply_factory(idx))
-            row, col = divmod(i, cols)
-            self._factory_grid.addWidget(btn, row, col)
-
-        self._factory_grp.setVisible(len(factory) > 0)
 
         # User list
         self.user_list.clear()
@@ -3953,7 +3986,7 @@ class VideomancerApp(QMainWindow):
         self.snap_tab    = SnapshotsTab()   # keep for snapshot callbacks
 
         self.tabs.addTab(self.prog_tab,   "PROGRAMS")
-        self.tabs.addTab(self.param_tab,  "MOTION")
+        self.tabs.addTab(self.param_tab,  "CONTROL")
         self.tabs.addTab(self.system_tab, "SYSTEM")
         self.tabs.addTab(self.state_tab,  "STATE")
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -4066,7 +4099,7 @@ class VideomancerApp(QMainWindow):
         lay.setSpacing(6)
 
         # Title — left aligned
-        logo_lbl = QLabel('VIDEOMANCER <span style="font-size:16px;">— Control</span>')
+        logo_lbl = QLabel('VIDEOMANCER')
         logo_lbl.setStyleSheet(
             "background:transparent;border:none;color:#ffffff;"
             "font-family:'Goldplay',sans-serif;"
@@ -4344,9 +4377,9 @@ class VideomancerApp(QMainWindow):
                     # (avoid resetting to 512 from responses that omit TSS)
                     has_tss = "t" in data or "sp" in data or "sl" in data
                     if has_tss:
-                        t  = data.get("t",  [512]*12)
-                        sp = data.get("sp", [512]*12)
-                        sl = data.get("sl", [512]*12)
+                        t  = data.get("t",  [0]*12)
+                        sp = data.get("sp", [0]*12)
+                        sl = data.get("sl", [0]*12)
                         self.param_tab.apply_state(m, t, sp, sl, sr)
                     else:
                         # Apply only manual + operator, skip recently edited
@@ -4356,7 +4389,7 @@ class VideomancerApp(QMainWindow):
                             if now - last_edit < 3.0:
                                 continue
                             card = self.param_tab.channels[i]
-                            card.set_manual(m[i] if i < len(m) else 512)
+                            card.set_manual(m[i] if i < len(m) else 0)
                             card.set_operator(sr[i] if i < len(sr) else 0)
                     # snapshot stage 1 complete → fetch presets
                     if self._snap_stage == 1:
@@ -4370,10 +4403,10 @@ class VideomancerApp(QMainWindow):
                     # and not while user is actively editing
                     if getattr(self, "_tss_readback_pending", False) and not self._user_editing:
                         self._tss_readback_pending = False
-                        m  = data.get("m",  [512]*12)
-                        t  = data.get("t",  [512]*12)
-                        sp = data.get("sp", [512]*12)
-                        sl = data.get("sl", [512]*12)
+                        m  = data.get("m",  [0]*12)
+                        t  = data.get("t",  [0]*12)
+                        sp = data.get("sp", [0]*12)
+                        sl = data.get("sl", [0]*12)
                         sr = data.get("sr", [0]*12)
                         self.param_tab.apply_state(m, t, sp, sl, sr)
 
@@ -4604,6 +4637,8 @@ class VideomancerApp(QMainWindow):
         self._poll_count += 1
         if self._poll_count % 4 == 0:
             self._worker.send("transport status")
+        if not self._user_editing:
+            self._worker.send("program state")
         if self._poll_count % 20 == 0:
             self._worker.send("video status")
 
@@ -4742,9 +4777,9 @@ class VideomancerApp(QMainWindow):
                 return _abort_restore()
             if parameters:
                 m_str  = ",".join(str(v) for v in parameters)
-                t_str  = ",".join("512" for _ in range(12))
-                sp_str = ",".join("512" for _ in range(12))
-                sl_str = ",".join("512" for _ in range(12))
+                t_str  = ",".join("0" for _ in range(12))
+                sp_str = ",".join("0" for _ in range(12))
+                sl_str = ",".join("0" for _ in range(12))
                 sr_str = ",".join("0"   for _ in range(12))
                 self._worker.send(
                     f"program presets save 0 live "
@@ -4752,7 +4787,7 @@ class VideomancerApp(QMainWindow):
                 )
                 self._worker.send("program presets apply 0 user")
                 self.param_tab.apply_state(
-                    parameters, [512]*12, [512]*12, [512]*12, [0]*12
+                    parameters, [0]*12, [0]*12, [0]*12, [0]*12
                 )
             self.state_tab.set_snapshot_status("Restoring presets…")
             QTimer.singleShot(400, step3)
