@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QMessageBox, QInputDialog, QDialog, QDialogButtonBox,
 )
 import math
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, QThread, QRectF, QPointF
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QThread, QRectF, QPointF
 from PyQt6.QtGui import (QColor, QTextCharFormat, QTextCursor, QFont,
                           QPainter, QPen, QLinearGradient, QPainterPath)
 
@@ -108,6 +108,463 @@ WARN     = "#e0d0ff"
 
 PARAM_RANGE = 1023   # 0–1023, centre = 512
 
+# ── Video Monitor (floating capture card preview) ─────────────────────
+
+class _VideoDisplay(QWidget):
+    """Minimal video display — caches scaled pixmap for fast repaint."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._image = None
+        self._text = ""
+        self._cached_pixmap = None
+        self._cached_size = None
+        self._draw_x = 0
+        self._draw_y = 0
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    def setFrame(self, image, _ref=None):
+        self._image = image
+        self._text = ""
+        # Scale once here, paint just blits the cached pixmap
+        ww, wh = self.width(), self.height()
+        iw, ih = image.width(), image.height()
+        scale = min(ww / iw, wh / ih)
+        dw, dh = int(iw * scale), int(ih * scale)
+        self._draw_x = (ww - dw) // 2
+        self._draw_y = (wh - dh) // 2
+        from PyQt6.QtGui import QPixmap
+        self._cached_pixmap = QPixmap.fromImage(
+            image.scaled(dw, dh, Qt.AspectRatioMode.IgnoreAspectRatio,
+                         Qt.TransformationMode.FastTransformation))
+        self.update()
+
+    def setText(self, text):
+        self._text = text
+        self._image = None
+        self._cached_pixmap = None
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+        if self._cached_pixmap:
+            p.drawPixmap(self._draw_x, self._draw_y, self._cached_pixmap)
+        elif self._text:
+            p.setPen(QColor(160, 160, 160))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
+        p.end()
+
+
+class _CaptureThread(QThread):
+    """Background thread using OpenCV for capture — native C++ decode, no pipe.
+    Falls back to FFmpeg pipe for DeckLink devices."""
+
+    def __init__(self, device_index, device_name="", fmt="cv2"):
+        super().__init__()
+        self._index = device_index
+        self._name = device_name
+        self._fmt = fmt
+        self._running = False
+        self.error_msg = ""
+        self._latest_qimg = None
+        self._latest_id = 0
+        self._cap_w = 0
+        self._cap_h = 0
+
+    def run(self):
+        self._running = True
+        self.error_msg = ""
+
+        if self._fmt == "decklink":
+            self._run_ffmpeg()
+            return
+
+        # OpenCV capture — all decoding happens in C++
+        try:
+            import cv2
+        except ImportError:
+            self.error_msg = "OpenCV not installed"
+            return
+
+        cap = cv2.VideoCapture(self._index)
+        if not cap.isOpened():
+            self.error_msg = f"Cannot open device {self._index}"
+            return
+
+        # Minimize internal buffering — always grab the latest frame
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        self._cap_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._cap_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        from PyQt6.QtGui import QImage
+        import numpy as np
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            h, w, ch = frame.shape
+            self._cap_w = w
+            self._cap_h = h
+            # contiguous copy via numpy (faster than QImage.copy)
+            rgb = np.ascontiguousarray(frame)
+            img = QImage(rgb.data, w, h, w * ch,
+                         QImage.Format.Format_BGR888)
+            img._numpy_ref = rgb  # prevent GC
+            self._latest_qimg = img
+            self._latest_id += 1
+
+        cap.release()
+
+    def _run_ffmpeg(self):
+        """FFmpeg fallback for DeckLink devices."""
+        import subprocess, threading
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "decklink", "-i", str(self._index),
+            "-r", "30",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=8 * 1024 * 1024)
+        except FileNotFoundError:
+            self.error_msg = "FFmpeg not installed"
+            return
+
+        time.sleep(2)
+        if proc.poll() is not None:
+            self.error_msg = "DeckLink capture failed"
+            return
+
+        from PyQt6.QtGui import QImage
+        w, h = 1920, 1080
+        self._cap_w, self._cap_h = w, h
+        frame_size = w * h * 3
+        buf = bytearray(frame_size)
+
+        while self._running:
+            view = memoryview(buf)
+            filled = 0
+            while filled < frame_size and self._running:
+                n = proc.stdout.readinto(view[filled:])
+                if not n:
+                    self._running = False
+                    break
+                filled += n
+            if filled == frame_size:
+                img = QImage(bytes(buf), w, h, w * 3,
+                             QImage.Format.Format_BGR888)
+                self._latest_qimg = img.copy()
+                self._latest_id += 1
+
+        proc.terminate()
+
+    def stop(self):
+        self._running = False
+
+
+def _find_avfoundation_capture_cards() -> list:
+    """Use ffmpeg to find ONLY capture card devices (no cameras, no screens).
+    Checks both video and audio sections since some pro cards only appear as audio."""
+    import subprocess
+    devices = []
+    # Known capture card identifiers — must be hardware capture devices
+    _CAPTURE_KEYWORDS = [
+        "blackmagic", "decklink", "ultrastudio", "intensity",
+        "elgato", "cam link", "camlink", "hd60", "4k60",
+        "magewell", "avermedia", "game capture",
+        "usb video", "usb3", "usb 3", "hdmi capture", "sdi",
+        "video capture", "thunderbolt",
+    ]
+    # Explicitly excluded — NEVER show these
+    _EXCLUDED = [
+        "facetime", "isight", "built-in", "macbook",
+        "microphone", "capture screen", "screen",
+        "obs", "virtual", "iphone", "ipad", "ndi",
+        "airplay",
+    ]
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "avfoundation",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=5)
+        section = None
+        for line in result.stderr.splitlines():
+            if "AVFoundation video devices" in line:
+                section = "video"
+                continue
+            if "AVFoundation audio devices" in line:
+                section = "audio"
+                continue
+            if section and "]" in line:
+                parts = line.split("]")
+                if len(parts) >= 3:
+                    idx_str = parts[-2].strip().lstrip("[")
+                    name = parts[-1].strip()
+                    try:
+                        idx = int(idx_str)
+                        lower = name.lower()
+                        if any(e in lower for e in _EXCLUDED):
+                            continue
+                        if any(k in lower for k in _CAPTURE_KEYWORDS):
+                            tag = "avf_video" if section == "video" else "avf_audio"
+                            devices.append((tag, idx, name))
+                    except ValueError:
+                        pass
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return devices
+
+
+def _find_decklink_devices() -> list:
+    """Use ffmpeg to list DeckLink devices (Blackmagic pro capture cards).
+    Only works if FFmpeg was built with --enable-decklink."""
+    import subprocess
+    devices = []
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "decklink",
+             "-list_devices", "true", "-i", ""],
+            capture_output=True, text=True, timeout=5)
+        # If FFmpeg doesn't support decklink, stderr will say "Unknown input format"
+        if "Unknown input format" in result.stderr:
+            return []
+        for line in result.stderr.splitlines():
+            # Format: [decklink ...] 'UltraStudio Recorder 3G'
+            if "'" in line and "[decklink" in line.lower():
+                parts = line.split("'")
+                if len(parts) >= 2:
+                    name = parts[1]
+                    if name and name.lower() != "decklink":
+                        devices.append(("decklink", name, name))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return devices
+
+
+
+
+class MonitorWindow(QWidget):
+    """Floating window showing live video from capture cards.
+    Supports: UVC devices (OpenCV), AVFoundation, DeckLink (Blackmagic)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("VIDEOMANCER — Monitor")
+        self.resize(640, 480)
+        self.setMinimumSize(320, 240)
+        self.setStyleSheet(f"background:#000000;")
+
+        self._cap_thread = None   # Capture thread
+        self._source_type = None  # "cv2", "avf", or "decklink"
+        self._display_timer = QTimer()
+        self._display_timer.setInterval(33)  # ~30fps grab
+        self._display_timer.timeout.connect(self._grab_frame)
+        self._last_grabbed_id = 0
+        self._current_res_index = 0  # start at highest, auto-scale down
+        self._current_dev = None
+        self._adaptive_checks = 0
+        self._stable_count = 0
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Toolbar
+        toolbar = QWidget()
+        toolbar.setFixedHeight(36)
+        toolbar.setStyleSheet(f"background:{BG};")
+        tl = QHBoxLayout(toolbar)
+        tl.setContentsMargins(8, 4, 8, 4)
+        tl.setSpacing(6)
+
+        tl.addWidget(QLabel("Source:"))
+        self._source_combo = QComboBox()
+        self._source_combo.setMinimumWidth(250)
+        self._source_combo.currentIndexChanged.connect(self._on_source_changed)
+        tl.addWidget(self._source_combo)
+
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedWidth(28)
+        refresh_btn.clicked.connect(self._do_refresh)
+        tl.addWidget(refresh_btn)
+
+        self._screenshot_btn = QPushButton("📷")
+        self._screenshot_btn.setFixedWidth(28)
+        self._screenshot_btn.setToolTip("Save screenshot")
+        self._screenshot_btn.clicked.connect(self._take_screenshot)
+        self._screenshot_btn.setEnabled(False)
+        tl.addWidget(self._screenshot_btn)
+
+        tl.addStretch()
+
+        self._status_lbl = QLabel("Scanning...")
+        self._status_lbl.setStyleSheet(
+            f"color:{TEXT_DIM};font-size:10px;background:transparent;")
+        tl.addWidget(self._status_lbl)
+
+        lay.addWidget(toolbar)
+
+        # Video display — custom widget, no QLabel overhead
+        self._video_lbl = _VideoDisplay()
+        self._video_lbl.setText("Scanning for capture devices...")
+        lay.addWidget(self._video_lbl, stretch=1)
+
+        self._frame_count = 0
+        self._fps_time = 0.0
+        self._last_frame = None
+        self._devices = []  # list of (type, id, name) tuples
+        self._scanned = False  # only scan when window is shown
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._scanned:
+            self._scanned = True
+            QTimer.singleShot(100, self._refresh_sources)
+
+    def _do_refresh(self):
+        self._video_lbl.setText("Scanning for capture devices...")
+        self._status_lbl.setText("Scanning...")
+        QTimer.singleShot(50, self._refresh_sources)
+
+    def _refresh_sources(self):
+        self._source_combo.blockSignals(True)
+        self._source_combo.clear()
+        self._active_index = -1
+
+        # Collect from all backends — only devices that exist right now
+        self._devices = []
+        seen_names = set()
+
+        # 1. DeckLink (Blackmagic)
+        for d in _find_decklink_devices():
+            if d[2] not in seen_names:
+                seen_names.add(d[2])
+                self._devices.append(d)
+
+        # 2. AVFoundation VIDEO capture cards only — use their video index for OpenCV
+        for d in _find_avfoundation_capture_cards():
+            if d[0] == "avf_video" and d[2] not in seen_names:
+                seen_names.add(d[2])
+                # Store as cv2 type with the AVF video index — this is the correct index
+                self._devices.append(("cv2", d[1], d[2]))
+
+        # Populate dropdown — clean names, no emojis
+        if not self._devices:
+            self._source_combo.addItem("No capture devices found", None)
+            self._status_lbl.setText("No devices")
+            self._video_lbl.setText(
+                "No capture devices found\n\n"
+                "Supported: HDMI/SDI capture cards\n"
+                "(Blackmagic, Elgato, Magewell, etc.)")
+        else:
+            self._source_combo.addItem("Select source", None)
+            for i, d in enumerate(self._devices):
+                self._source_combo.addItem(d[2], i)
+            self._status_lbl.setText(f"{len(self._devices)} device{'s' if len(self._devices) != 1 else ''}")
+
+        self._source_combo.blockSignals(False)
+
+    def _on_source_changed(self, _idx):
+        self._stop_capture()
+        # Clear green dot from all items
+        for i in range(self._source_combo.count()):
+            d = self._source_combo.itemData(i)
+            if d is not None and isinstance(d, int) and 0 <= d < len(self._devices):
+                self._source_combo.setItemText(i, self._devices[d][2])
+        data = self._source_combo.currentData()
+        if data is None or not isinstance(data, int) or data < 0:
+            return
+        if data >= len(self._devices):
+            return
+        dev = self._devices[data]
+        # Green dot on active
+        cur = self._source_combo.currentIndex()
+        self._source_combo.setItemText(cur, f"\u2022 {dev[2]}")
+        self._start_capture(dev)
+
+    def _start_capture(self, dev):
+        dtype, did, dname = dev
+        self._source_type = dtype
+        self._video_lbl.setText(f"Connecting to {dname}...")
+
+        if dtype == "decklink":
+            self._cap_thread = _CaptureThread(did, dname, fmt="decklink")
+        elif dtype == "cv2":
+            self._cap_thread = _CaptureThread(did, dname, fmt="cv2")
+        else:
+            return
+
+        self._cap_thread.start()
+        self._screenshot_btn.setEnabled(True)
+        self._frame_count = 0
+        self._fps_time = time.monotonic()
+        self._last_grabbed_id = 0
+        self._display_timer.start()
+        QTimer.singleShot(5000, lambda: self._check_started(dname))
+
+    def _stop_capture(self):
+        self._display_timer.stop()
+        if self._cap_thread is not None:
+            self._cap_thread.stop()
+            self._cap_thread.wait(3000)
+            self._cap_thread = None
+        self._screenshot_btn.setEnabled(False)
+        self._status_lbl.setText("")
+        self._source_type = None
+
+    def _grab_frame(self):
+        """Timer-driven: grab latest QImage from capture thread."""
+        cap = self._cap_thread
+        if not cap or not cap._latest_qimg:
+            return
+        fid = cap._latest_id
+        if fid == self._last_grabbed_id:
+            return
+        self._last_grabbed_id = fid
+
+        self._video_lbl.setFrame(cap._latest_qimg, None)
+
+        self._frame_count += 1
+        elapsed = time.monotonic() - self._fps_time
+        if elapsed >= 1.0:
+            fps = self._frame_count / elapsed
+            self._status_lbl.setText(f"{fps:.1f} fps  ({cap._cap_w}x{cap._cap_h})")
+            self._frame_count = 0
+            self._fps_time = time.monotonic()
+
+    def _check_started(self, dname):
+        """Check if capture produced any frames after timeout."""
+        if self._cap_thread and self._cap_thread._latest_id == 0:
+            err = getattr(self._ffmpeg_cap, 'error_msg', '')
+            self._stop_capture()
+            self._video_lbl.setText(
+                f"Could not capture from {dname}\n\n"
+                f"This device may require FFmpeg with DeckLink support.\n"
+                f"Install: brew install ffmpeg (with --enable-decklink)\n"
+                f"Or use Blackmagic Media Express to verify the input signal."
+                + (f"\n\n{err}" if err else ""))
+            self._status_lbl.setText("Capture failed")
+
+    def _take_screenshot(self):
+        img = self._video_lbl._image
+        if not img or img.isNull():
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = Path.home() / "Documents" / f"videomancer_capture_{ts}.png"
+        img.copy().save(str(path), "PNG")  # copy for thread safety
+        self._status_lbl.setText(f"Saved: {path.name}")
+
+    closed = pyqtSignal()
+
+    def closeEvent(self, event):
+        self._stop_capture()
+        self.closed.emit()
+        event.accept()
+
+
 STYLESHEET = f"""
 QMainWindow, QWidget {{
     background: {BG};
@@ -174,7 +631,7 @@ QTabBar::tab {{
     letter-spacing: 2px;
     margin-right: 4px;
     border-radius: 4px;
-    min-width: 66px;
+    min-width: 80px;
 }}
 QTabBar::tab:selected {{
     background: {SURFACE2};
@@ -398,10 +855,12 @@ class ConnectionBar(QWidget):
 
     @staticmethod
     def find_all_videomancer_ports() -> List[str]:
-        """Return all serial ports that look like a Videomancer device."""
+        """Return all serial ports that look like a Videomancer device.
+        Deduplicates macOS tty/cu pairs — prefers cu. for outgoing connections."""
         if not HAS_SERIAL:
             return []
         ports = []
+        seen_ids = set()
         for p in list_ports.comports():
             desc = (p.description or "").lower()
             mfr  = (p.manufacturer or "").lower()
@@ -418,7 +877,17 @@ class ConnectionBar(QWidget):
             elif "usb serial" in desc or "usb serial" in mfr:
                 match = True
             if match:
-                ports.append(p.device)
+                # Deduplicate macOS tty/cu pairs by location or serial_number
+                port_id = getattr(p, 'serial_number', None) or getattr(p, 'location', None) or p.device
+                # Skip /dev/tty.* if we already have the /dev/cu.* for same device
+                if name.startswith("/dev/tty."):
+                    cu_equiv = p.device.replace("/dev/tty.", "/dev/cu.")
+                    if cu_equiv in ports:
+                        continue
+                    port_id = cu_equiv  # group with cu variant
+                if port_id not in seen_ids:
+                    seen_ids.add(port_id)
+                    ports.append(p.device)
         return ports
 
     def try_auto_connect(self):
@@ -983,7 +1452,7 @@ class KnobWidget(QWidget):
             self._smooth_timer.stop()
             return
         diff = self._frac - self._display_frac
-        glide = 0.15
+        glide = 0.8
         if abs(diff) > 0.001:
             self._display_frac += diff * glide
             self.update()
@@ -1142,11 +1611,7 @@ class SmoothFader(QWidget):
         target = float(self._value)
         diff = target - self._display_val
         if abs(diff) > 0.5:
-            self._display_val += diff * 0.6
-            self._velocity = 0.0
-            self.update()
-        elif abs(diff) > 0.01:
-            self._display_val = target
+            self._display_val += diff * 0.8
             self._velocity = 0.0
             self.update()
         elif self._display_val != target:
@@ -1302,13 +1767,8 @@ class HorizontalFader(QWidget):
             return
         target = float(self._value)
         diff = target - self._display_val
-        if abs(diff) > 0.3:
-            self._velocity += diff * 0.05
-            self._velocity *= 0.82
-            self._display_val += self._velocity
-            self.update()
-        elif abs(diff) > 0.05:
-            self._display_val += diff * 0.08
+        if abs(diff) > 0.5:
+            self._display_val += diff * 0.8
             self._velocity = 0.0
             self.update()
         elif self._display_val != target:
@@ -2030,8 +2490,11 @@ class ChannelCard(QWidget):
             if self.val_lbl:
                 self.val_lbl.setText(pct)
         elif self.slider:
+            if hasattr(self.slider, '_dragging') and self.slider._dragging:
+                self._updating = False
+                return  # never touch fader during active drag
             if hasattr(self.slider, 'setValue') and hasattr(self.slider, '_display_val'):
-                self.slider.setValue(value, animate=silent)
+                self.slider.setValue(value, animate=True)
             else:
                 self.slider.setValue(value)
             if self.val_lbl:
@@ -2082,7 +2545,6 @@ class ChannelCard(QWidget):
             knob._value = val
             knob._frac = (val - knob._min) / max(1, knob._max - knob._min)
             # Use slower glide for TSS — spread over full poll interval
-            knob._tss_glide = True
             if not knob._smooth_timer.isActive():
                 knob._smooth_timer.start()
         self._updating = False
@@ -2539,29 +3001,44 @@ class ParametersTab(QWidget):
             )
 
     def apply_modulation_status(self, modulators: list):
-        """Apply state from modulation status — skip channels being edited."""
+        """Apply state from modulation status — skip unchanged and recently edited."""
         now = __import__('time').monotonic()
+        # Cache previous state to skip unchanged channels
+        if not hasattr(self, '_prev_mod'):
+            self._prev_mod = [None] * 12
         for i, mod in enumerate(modulators[:12]):
+            # Skip if this channel's data is identical to last poll
+            if mod == self._prev_mod[i]:
+                continue
+            self._prev_mod[i] = mod
+
             card = self.channels[i]
-            # Skip channels edited within the last 0.6 seconds
-            # BUT always update toggle switches (device state is authoritative)
             last_edit = self._last_sent.get(f"edit_time_{i}", 0)
             recently_edited = now - last_edit < 3.0
-            m = mod.get("m", 512)
+            m = mod.get("m", 0)
             if card._is_toggle:
-                # Always sync toggle state from device
                 card.set_manual(m)
-                card.set_operator(mod.get("s", 0))
-                # Only show LFO output on ModBar, not raw switch value
+                s = mod.get("s", 0)
+                if s != card.get_operator():
+                    card.set_operator(s)
                 if "o" in mod:
                     card.set_output(mod["o"])
             else:
-                if recently_edited:
-                    continue
                 o = mod.get("o", m)
-                card.set_manual(m)
-                card.set_operator(mod.get("s", 0))
+                if not recently_edited:
+                    card.set_manual(m)
+                    s = mod.get("s", 0)
+                    if s != card.get_operator():
+                        card.set_operator(s)
+                # Always update output bar — shows live modulation even during edits
                 card.set_output(o)
+
+            # Update TSS from fast poll if present
+            if "t" in mod or "sp" in mod or "sl" in mod:
+                t_val  = mod.get("t", 0)
+                sp_val = mod.get("sp", 0)
+                sl_val = mod.get("sl", 0)
+                card.set_tss(t_val, sp_val, sl_val, silent=True)
 
     def set_transport_state(self, state: str):
         """Update play/stop button styling based on transport state."""
@@ -2863,6 +3340,9 @@ class ConsoleWidget(QWidget):
         return f
 
     def append(self, prefix: str, key: str, payload: str):
+        # Skip high-frequency modulation logs to prevent event loop flooding
+        if key == "modulation" and prefix == "ok":
+            return
         cursor = self.text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         ts   = time.strftime("%H:%M:%S")
@@ -2897,13 +3377,13 @@ class SnapshotManager:
     # ------------------------------------------------------------------
 
     def save(self, label: str, program: str, parameters: List[int],
-             presets: dict, settings: dict) -> Path:
+             presets: dict, settings: dict, tss: dict = None) -> Path:
         """Write a snapshot file and return its path."""
         ts   = datetime.now()
         slug = re.sub(r"[^\w\-]", "_", label.strip())[:40] or "snapshot"
         fname = f"{ts.strftime('%Y%m%d_%H%M%S')}_{slug}.json"
         data  = {
-            "version":    1,
+            "version":    2,
             "timestamp":  ts.isoformat(),
             "label":      label.strip(),
             "program":    program,
@@ -2911,6 +3391,11 @@ class SnapshotManager:
             "presets":    presets,
             "settings":   settings,
         }
+        if tss:
+            data["t"]  = tss.get("t",  [0]*12)
+            data["sp"] = tss.get("sp", [0]*12)
+            data["sl"] = tss.get("sl", [0]*12)
+            data["sr"] = tss.get("sr", [0]*12)
         path = self.folder / fname
         path.write_text(json.dumps(data, indent=2))
         return path
@@ -3111,9 +3596,9 @@ class SnapshotsTab(QWidget):
 
     def populate_for_save(self, label: str, program: str,
                           parameters: List[int], presets: dict,
-                          settings: dict):
+                          settings: dict, tss: dict = None):
         """Called by main window after collecting all device data."""
-        path = self._manager.save(label, program, parameters, presets, settings)
+        path = self._manager.save(label, program, parameters, presets, settings, tss=tss)
         self.reload_list()
         self.save_btn.setEnabled(self._connected)
         self.progress_lbl.setText(f"Saved: {path.name}")
@@ -3853,8 +4338,8 @@ class StateTab(QWidget):
             self.snap_status.setText("Collecting device state…")
             self.on_capture(label)
 
-    def populate_for_save(self, label, program, parameters, presets, settings):
-        self._manager.save(label, program, parameters, presets, settings)
+    def populate_for_save(self, label, program, parameters, presets, settings, tss=None):
+        self._manager.save(label, program, parameters, presets, settings, tss=tss)
         self._reload_snapshots()
         self._save_snap_btn.setEnabled(self._connected)
         self.set_snapshot_status(f"✓ Saved: {label}")
@@ -3914,7 +4399,7 @@ class VideomancerApp(QMainWindow):
         self._edit_cooldown.timeout.connect(self._on_edit_cooldown)
         # Bidirectional sync — poll device every 500ms
         self._poll_timer = QTimer()
-        self._poll_timer.setInterval(250)
+        self._poll_timer.setInterval(350)
         self._poll_timer.timeout.connect(self._poll_device)
         # snapshot collection state
         self._snap_label:    str  = ""
@@ -3932,8 +4417,9 @@ class VideomancerApp(QMainWindow):
         self._sparkle = SparkleRing(self)
         self._sparkle.hide()
 
-        # Auto-connect to Videomancer if found on startup
-        QTimer.singleShot(100, self._try_auto_connect)
+        # Auto-connect — stagger by window number to avoid port race
+        connect_delay = 100 + (self._window_number - 1) * 500
+        QTimer.singleShot(connect_delay, self._try_auto_connect)
         # Hot-plug timer: scan for device every 3s when disconnected
         self._hotplug_timer = QTimer()
         self._hotplug_timer.setInterval(2000)
@@ -3977,7 +4463,8 @@ class VideomancerApp(QMainWindow):
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setUsesScrollButtons(False)
+        self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
 
         self.prog_tab    = ProgramsTab()
         self.param_tab   = ParametersTab()
@@ -4021,13 +4508,7 @@ class VideomancerApp(QMainWindow):
 
         self.conn_bar.data_refresh_btn.setVisible(False)
 
-        # Active program label as corner widget of tab bar
-        self.conn_bar._prog_lbl.setStyleSheet(
-            f"color:#ffffff;font-size:15px;font-weight:bold;letter-spacing:1px;"
-            f"background:transparent;border:none;padding:11px 8px 0px 8px;"
-        )
-        self.conn_bar._prog_lbl.setVisible(False)
-        self.tabs.setCornerWidget(self.conn_bar._prog_lbl, Qt.Corner.TopRightCorner)
+        self._header_prog_lbl.setVisible(False)
         bl.addWidget(self.tabs, stretch=1)
 
         # Console
@@ -4109,6 +4590,17 @@ class VideomancerApp(QMainWindow):
 
         lay.addStretch()
 
+        # Active program label — in header, won't overlap tabs
+        self._header_prog_lbl = QLabel("")
+        self._header_prog_lbl.setStyleSheet(
+            f"color:#ffffff;font-size:14px;font-weight:bold;letter-spacing:1px;"
+            f"background:transparent;border:none;"
+        )
+        self._header_prog_lbl.setVisible(False)
+        lay.addWidget(self._header_prog_lbl)
+
+        lay.addStretch()
+
         # Dual Cast — toggle a second window
         self._dual_btn = QPushButton("Dual Cast")
         self._dual_btn.setCheckable(True)
@@ -4127,6 +4619,25 @@ class VideomancerApp(QMainWindow):
         self._dual_btn.toggled.connect(self._toggle_dual_cast)
         lay.addWidget(self._dual_btn)
         self._dual_window = None
+
+        # Monitor — floating capture card preview
+        self._monitor_btn = QPushButton("Monitor")
+        self._monitor_btn.setCheckable(True)
+        self._monitor_btn.setFixedHeight(24)
+        self._monitor_btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{SURFACE2}; border:1px solid {BORDER};
+                border-radius:3px; color:{TEXT_DIM};
+                font-size:10px; font-weight:bold; padding:2px 8px;
+            }}
+            QPushButton:checked {{
+                background:#7c3aed; border:2px solid #ffffff;
+                color:#ffffff;
+            }}
+        """)
+        self._monitor_btn.toggled.connect(self._toggle_monitor)
+        lay.addWidget(self._monitor_btn)
+        self._monitor_window = None
 
         # Update available banner (hidden until check completes)
         self._update_btn = QPushButton("")
@@ -4177,6 +4688,24 @@ class VideomancerApp(QMainWindow):
             self._dual_window = None
 
     # ------------------------------------------------------------------
+    # Monitor
+    # ------------------------------------------------------------------
+
+    def _toggle_monitor(self, checked: bool):
+        if checked:
+            if self._monitor_window is None:
+                self._monitor_window = MonitorWindow()
+                self._monitor_window.closed.connect(
+                    lambda: self._monitor_btn.setChecked(False)
+                )
+            self._monitor_window.show()
+            self._monitor_window.raise_()
+        else:
+            if self._monitor_window is not None:
+                self._monitor_window.close()
+                self._monitor_window = None
+
+    # ------------------------------------------------------------------
     # Auto-update
     # ------------------------------------------------------------------
 
@@ -4223,6 +4752,9 @@ class VideomancerApp(QMainWindow):
     def _do_connect(self, port: str):
         if self._worker and self._worker.isRunning():
             return
+        # Claim port immediately to prevent other windows from grabbing it
+        _claimed_ports.add(port)
+        self._claimed_port = port
         self._worker = SerialWorker(self)
         self._worker.connected.connect(self._on_connected)
         self._worker.disconnected.connect(self._on_disconnected)
@@ -4239,6 +4771,7 @@ class VideomancerApp(QMainWindow):
 
     @pyqtSlot(str)
     def _on_connected(self, port: str):
+        # Port already claimed in _do_connect, just ensure it's set
         _claimed_ports.add(port)
         self._claimed_port = port
         self.conn_bar.set_connected(port)
@@ -4284,7 +4817,7 @@ class VideomancerApp(QMainWindow):
         # Clear active program and switch to Programs tab (splash screen)
         self._active_program = None
         if hasattr(self, 'conn_bar') and hasattr(self.conn_bar, '_prog_lbl'):
-            self.conn_bar._prog_lbl.setVisible(False)
+            self._header_prog_lbl.setVisible(False)
         if hasattr(self, '_header_prog'):
             self._header_prog.setText("")
         self.tabs.setCurrentIndex(0)
@@ -4298,8 +4831,11 @@ class VideomancerApp(QMainWindow):
     def _on_error(self, msg: str):
         self.status_bar.showMessage(f"Error: {msg}")
         self.console.append("error", "serial", msg)
-        # Only show dialog for connection errors, not unplug write errors
+        # Release claimed port on connection failure
         if "Could not open" in msg:
+            if self._claimed_port:
+                _claimed_ports.discard(self._claimed_port)
+                self._claimed_port = None
             QMessageBox.warning(self, "Connection Error", msg)
 
     # ------------------------------------------------------------------
@@ -4347,7 +4883,8 @@ class VideomancerApp(QMainWindow):
                     self.prog_tab.set_loading_program(False)
                     self.status_bar.showMessage(f"Loaded: {name}", 4000)
                     self._trigger_poof()
-                    # Fetch state + presets + TSS after load
+                    # Fetch state + presets + TSS + info after load
+                    QTimer.singleShot(500, lambda: self._worker.send("program info"))
                     QTimer.singleShot(1500, self._request_state)
                     QTimer.singleShot(1500, self._fetch_presets)
                     QTimer.singleShot(1800, self._fetch_tss_readback_auto)
@@ -4394,6 +4931,12 @@ class VideomancerApp(QMainWindow):
                     # snapshot stage 1 complete → fetch presets
                     if self._snap_stage == 1:
                         self._snap_params = m
+                        self._snap_tss = {
+                            "t":  data.get("t",  [0]*12),
+                            "sp": data.get("sp", [0]*12),
+                            "sl": data.get("sl", [0]*12),
+                            "sr": sr,
+                        }
                         self._snap_stage  = 2
                         self.state_tab.set_snapshot_status("Collecting presets…")
                         self._worker.send("program presets list")
@@ -4497,12 +5040,14 @@ class VideomancerApp(QMainWindow):
             # snapshot stage 3 complete → write file
             if self._snap_stage == 3:
                 self._snap_stage = 0
+                tss = getattr(self, '_snap_tss', {})
                 self.state_tab.populate_for_save(
                     self._snap_label,
                     self._active_program or "unknown",
                     self._snap_params,
                     self._snap_presets,
                     self._snap_settings,
+                    tss=tss,
                 )
 
     def _update_uptime(self):
@@ -4609,10 +5154,10 @@ class VideomancerApp(QMainWindow):
             self._header_prog.setText(f"ACTIVE PROGRAM:  {name.upper()}")
         if hasattr(self, 'conn_bar') and hasattr(self.conn_bar, '_prog_lbl'):
             if name:
-                self.conn_bar._prog_lbl.setText(f"ACTIVE PROGRAM  —  {name.upper()}")
-                self.conn_bar._prog_lbl.setVisible(True)
+                self._header_prog_lbl.setText(f"{name.upper()}")
+                self._header_prog_lbl.setVisible(True)
             else:
-                self.conn_bar._prog_lbl.setVisible(False)
+                self._header_prog_lbl.setVisible(False)
         # Fetch parameter names for this program
         if self._worker:
             self._worker.send("program info")
@@ -4637,7 +5182,7 @@ class VideomancerApp(QMainWindow):
         self._poll_count += 1
         if self._poll_count % 4 == 0:
             self._worker.send("transport status")
-        if not self._user_editing:
+        if self._poll_count % 3 == 0 and not self._user_editing:
             self._worker.send("program state")
         if self._poll_count % 20 == 0:
             self._worker.send("video status")
@@ -4714,6 +5259,8 @@ class VideomancerApp(QMainWindow):
     def _apply_preset(self, index: int, type_str: str):
         if self._worker:
             self.param_tab._last_sent.clear()  # Reset dedup so all values re-sync
+            self._user_editing = True
+            self._edit_cooldown.start(1500)  # Block polling while preset applies
             cmd = f"program presets apply {index} {type_str}"
             self.console.append("cmd", cmd, "")
             self._worker.send(cmd)
@@ -4722,7 +5269,24 @@ class VideomancerApp(QMainWindow):
         if self._worker:
             vals  = [ch.get_manual() for ch in self.param_tab.channels]
             m_str = ",".join(str(v) for v in vals)
-            cmd   = f"program presets save {index} {name} m:{m_str}"
+            t_vals, sp_vals, sl_vals, sr_vals = [], [], [], []
+            for ch in self.param_tab.channels:
+                tss = ch.get_tss()
+                if tss:
+                    t_vals.append(str(tss[0]))
+                    sp_vals.append(str(tss[1]))
+                    sl_vals.append(str(tss[2]))
+                else:
+                    t_vals.append("0")
+                    sp_vals.append("0")
+                    sl_vals.append("0")
+                sr_vals.append(str(ch.get_operator()))
+            t_str  = ",".join(t_vals)
+            sp_str = ",".join(sp_vals)
+            sl_str = ",".join(sl_vals)
+            sr_str = ",".join(sr_vals)
+            cmd = (f"program presets save {index} {name} "
+                   f"m:{m_str} t:{t_str} sp:{sp_str} sl:{sl_str} sr:{sr_str}")
             self.console.append("cmd", cmd, "")
             self._worker.send(cmd)
             QTimer.singleShot(500, self._fetch_presets)
@@ -4777,17 +5341,21 @@ class VideomancerApp(QMainWindow):
                 return _abort_restore()
             if parameters:
                 m_str  = ",".join(str(v) for v in parameters)
-                t_str  = ",".join("0" for _ in range(12))
-                sp_str = ",".join("0" for _ in range(12))
-                sl_str = ",".join("0" for _ in range(12))
-                sr_str = ",".join("0"   for _ in range(12))
+                t_list  = data.get("t",  [0]*12)
+                sp_list = data.get("sp", [0]*12)
+                sl_list = data.get("sl", [0]*12)
+                sr_list = data.get("sr", [0]*12)
+                t_str  = ",".join(str(v) for v in t_list)
+                sp_str = ",".join(str(v) for v in sp_list)
+                sl_str = ",".join(str(v) for v in sl_list)
+                sr_str = ",".join(str(v) for v in sr_list)
                 self._worker.send(
                     f"program presets save 0 live "
                     f"m:{m_str} t:{t_str} sp:{sp_str} sl:{sl_str} sr:{sr_str}"
                 )
                 self._worker.send("program presets apply 0 user")
                 self.param_tab.apply_state(
-                    parameters, [0]*12, [0]*12, [0]*12, [0]*12
+                    parameters, t_list, sp_list, sl_list, sr_list
                 )
             self.state_tab.set_snapshot_status("Restoring presets…")
             QTimer.singleShot(400, step3)
@@ -4892,10 +5460,13 @@ class VideomancerApp(QMainWindow):
             self._uptime_timer.stop()
         if hasattr(self, '_update_checker') and self._update_checker.isRunning():
             self._update_checker.quit()
-            self._update_checker.wait(1000)
+        if self._monitor_window is not None:
+            self._monitor_window.close()
+            self._monitor_window = None
         if self._worker:
             self._worker.disconnect_port()
-            self._worker.wait(2000)
+            # Non-blocking — let thread clean up on its own
+            self._worker.quit()
         # Release claimed port and remove from global window list
         if self._claimed_port:
             _claimed_ports.discard(self._claimed_port)
@@ -4958,11 +5529,12 @@ def main():
         # Only spawn if there's an unclaimed device AND every existing
         # window already has a connection (avoids duplicate empty windows)
         if unclaimed:
+            windows = list(_app_windows)  # copy to avoid mutation during iteration
             all_connected = all(
-                w._worker and w._worker.isRunning() for w in _app_windows
+                w._worker and w._worker.isRunning() for w in windows
             )
             if all_connected:
-                _spawn_window(len(_app_windows) + 1)
+                _spawn_window(len(windows) + 1)
 
     hotplug = QTimer()
     hotplug.setInterval(3000)
