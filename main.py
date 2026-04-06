@@ -4772,23 +4772,7 @@ class VideomancerApp(QMainWindow):
         lay.addWidget(self._dual_btn)
         self._dual_window = None
 
-        # Monitor — floating capture card preview
-        self._monitor_btn = QPushButton("Monitor")
-        self._monitor_btn.setCheckable(True)
-        self._monitor_btn.setFixedHeight(24)
-        self._monitor_btn.setStyleSheet(f"""
-            QPushButton {{
-                background:{SURFACE2}; border:1px solid {BORDER};
-                border-radius:3px; color:{TEXT_DIM};
-                font-size:10px; font-weight:bold; padding:2px 8px;
-            }}
-            QPushButton:checked {{
-                background:#7c3aed; border:2px solid #ffffff;
-                color:#ffffff;
-            }}
-        """)
-        self._monitor_btn.toggled.connect(self._toggle_monitor)
-        lay.addWidget(self._monitor_btn)
+        # Monitor — hidden for now
         self._monitor_window = None
 
         # Update available banner (hidden until check completes)
