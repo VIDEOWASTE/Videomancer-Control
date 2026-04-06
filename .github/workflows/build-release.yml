@@ -29,6 +29,60 @@ jobs:
             --add-data "fonts:fonts" \
             main.py
 
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Decode certificate
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+
+          # Create temporary keychain
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+
+          # Import certificate
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k actions build.keychain
+
+          # Clean up
+          rm certificate.p12
+
+      - name: Sign the app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --force --options runtime --deep \
+            --sign "Developer ID Application: Nathaniel Coleman ($APPLE_TEAM_ID)" \
+            --timestamp \
+            dist/VideomancerControl.app
+
+          # Verify
+          codesign --verify --verbose dist/VideomancerControl.app
+
+      - name: Notarize the app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Create zip for notarization
+          ditto -c -k --keepParent dist/VideomancerControl.app VideomancerControl_notarize.zip
+
+          # Submit for notarization
+          xcrun notarytool submit VideomancerControl_notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the notarization ticket to the app
+          xcrun stapler staple dist/VideomancerControl.app
+
       - name: Create zip
         run: |
           cd dist
@@ -91,7 +145,7 @@ jobs:
         with:
           name: Videomancer Control ${{ github.ref_name }}
           body: |
-            ## Videomancer Control ${{ github.ref_name }} (Pre-Release)
+            ## Videomancer Control ${{ github.ref_name }}
 
             Desktop companion app for the LZX Industries Videomancer.
 
@@ -99,10 +153,7 @@ jobs:
             - **macOS**: `VideomancerControl_macOS_ARM.zip` — Apple Silicon (M1/M2/M3/M4). Intel Macs can run via Rosetta.
             - **Windows**: `VideomancerControl_Windows.zip`
 
-            First launch on macOS: System Settings > Privacy & Security > Open Anyway
-
-            ### Known Issues
-            - TSS (Time/Space/Slope) knob UI response is under development
+            Signed and notarized by Apple — no security warnings on macOS.
 
             ### Run from source
             ```
