@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -159,11 +159,13 @@ class _CaptureThread(QThread):
     """Background thread using OpenCV for capture — native C++ decode, no pipe.
     Falls back to FFmpeg pipe for DeckLink devices."""
 
-    def __init__(self, device_index, device_name="", fmt="cv2"):
+    def __init__(self, device_index, device_name="", fmt="cv2",
+                 decklink_format=None):
         super().__init__()
         self._index = device_index
         self._name = device_name
         self._fmt = fmt
+        self._decklink_format = decklink_format  # e.g. "Hp30" for 1080p30
         self._running = False
         self.error_msg = ""
         self._latest_qimg = None
@@ -217,12 +219,15 @@ class _CaptureThread(QThread):
         cap.release()
 
     def _run_ffmpeg(self):
-        """FFmpeg fallback for DeckLink devices."""
-        import subprocess, threading
-        cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+        """FFmpeg pipe capture for DeckLink (Blackmagic) devices."""
+        import subprocess
+
+        # Build ffmpeg command — format_code is required for DeckLink
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+        if self._decklink_format:
+            cmd += ["-format_code", self._decklink_format]
+        cmd += [
             "-f", "decklink", "-i", str(self._index),
-            "-r", "30",
             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"
         ]
         try:
@@ -233,13 +238,36 @@ class _CaptureThread(QThread):
             self.error_msg = "FFmpeg not installed"
             return
 
+        # Wait for ffmpeg to start, read stderr for resolution info
         time.sleep(2)
         if proc.poll() is not None:
-            self.error_msg = "DeckLink capture failed"
+            err = proc.stderr.read().decode(errors="replace").strip()
+            self.error_msg = f"DeckLink capture failed\n{err}" if err else \
+                "DeckLink capture failed — no signal or wrong format"
             return
 
+        # Detect resolution from stderr (ffmpeg prints stream info there)
+        w, h = 1920, 1080  # safe default
+        try:
+            import os
+            # Non-blocking read of what ffmpeg has printed so far
+            fd = proc.stderr.fileno()
+            os.set_blocking(fd, False)
+            try:
+                info = proc.stderr.read(4096)
+            except (BlockingIOError, OSError):
+                info = b""
+            os.set_blocking(fd, True)
+            if info:
+                import re
+                # Match "1920x1080" or similar resolution in stream info
+                m = re.search(r"(\d{3,4})x(\d{3,4})", info.decode(errors="replace"))
+                if m:
+                    w, h = int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+
         from PyQt6.QtGui import QImage
-        w, h = 1920, 1080
         self._cap_w, self._cap_h = w, h
         frame_size = w * h * 3
         buf = bytearray(frame_size)
@@ -265,12 +293,48 @@ class _CaptureThread(QThread):
         self._running = False
 
 
-def _find_avfoundation_capture_cards() -> list:
-    """Use ffmpeg to find ONLY capture card devices (no cameras, no screens).
-    Checks both video and audio sections since some pro cards only appear as audio."""
+def _find_capture_devices_native() -> list:
+    """Enumerate video devices using macOS native AVFoundation API via Swift.
+    Returns list of (index, name, manufacturer) — index matches OpenCV index.
+    This is the only reliable way to get correct OpenCV indices on macOS."""
     import subprocess
     devices = []
-    # Known capture card identifiers — must be hardware capture devices
+    try:
+        result = subprocess.run(
+            ["xcrun", "swift", "-e", """
+import AVFoundation
+let session = AVCaptureDevice.DiscoverySession(
+    deviceTypes: [.external, .builtInWideAngleCamera],
+    mediaType: .video, position: .unspecified)
+for (i, d) in session.devices.enumerated() {
+    print("\\(i)|\\(d.localizedName)|\\(d.manufacturer)")
+}
+"""],
+            capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3:
+                try:
+                    devices.append((int(parts[0]), parts[1], parts[2]))
+                except ValueError:
+                    pass
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return devices
+
+
+def _find_capture_devices() -> list:
+    """Find capture card devices for the monitor window.
+
+    Uses macOS native AVFoundation enumeration for correct OpenCV index mapping,
+    plus ffmpeg DeckLink detection for Blackmagic pro cards.
+
+    Returns list of (type, id, name) tuples.
+      type="cv2"     → id is OpenCV integer index
+      type="decklink" → id is device name (for ffmpeg -f decklink)
+    """
+    import subprocess
+
     _CAPTURE_KEYWORDS = [
         "blackmagic", "decklink", "ultrastudio", "intensity",
         "elgato", "cam link", "camlink", "hd60", "4k60",
@@ -278,43 +342,33 @@ def _find_avfoundation_capture_cards() -> list:
         "usb video", "usb3", "usb 3", "hdmi capture", "sdi",
         "video capture", "thunderbolt",
     ]
-    # Explicitly excluded — NEVER show these
     _EXCLUDED = [
         "facetime", "isight", "built-in", "macbook",
         "microphone", "capture screen", "screen",
         "obs", "virtual", "iphone", "ipad", "ndi",
         "airplay",
     ]
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-f", "avfoundation",
-             "-list_devices", "true", "-i", ""],
-            capture_output=True, text=True, timeout=5)
-        section = None
-        for line in result.stderr.splitlines():
-            if "AVFoundation video devices" in line:
-                section = "video"
-                continue
-            if "AVFoundation audio devices" in line:
-                section = "audio"
-                continue
-            if section and "]" in line:
-                parts = line.split("]")
-                if len(parts) >= 3:
-                    idx_str = parts[-2].strip().lstrip("[")
-                    name = parts[-1].strip()
-                    try:
-                        idx = int(idx_str)
-                        lower = name.lower()
-                        if any(e in lower for e in _EXCLUDED):
-                            continue
-                        if any(k in lower for k in _CAPTURE_KEYWORDS):
-                            tag = "avf_video" if section == "video" else "avf_audio"
-                            devices.append((tag, idx, name))
-                    except ValueError:
-                        pass
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+
+    devices = []
+    seen_names = set()
+
+    # 1. Native macOS enumeration — correct OpenCV indices
+    for idx, name, manufacturer in _find_capture_devices_native():
+        lower = name.lower()
+        mfr_lower = manufacturer.lower()
+        if any(e in lower for e in _EXCLUDED):
+            continue
+        if any(k in lower for k in _CAPTURE_KEYWORDS) \
+                or any(k in mfr_lower for k in _CAPTURE_KEYWORDS):
+            devices.append(("cv2", idx, name))
+            seen_names.add(name)
+
+    # 2. DeckLink devices via ffmpeg (for Blackmagic cards not in AVFoundation video)
+    for d in _find_decklink_devices():
+        if d[2] not in seen_names:
+            seen_names.add(d[2])
+            devices.append(d)
+
     return devices
 
 
@@ -342,6 +396,49 @@ def _find_decklink_devices() -> list:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return devices
+
+
+
+def _find_decklink_formats(device_name: str) -> list:
+    """Query available input formats for a DeckLink device.
+    Returns list of (format_code, description) tuples, e.g.
+    [("Hp30", "1080p 30"), ("hp60", "1080p 59.94"), ...]"""
+    import subprocess, re
+    formats = []
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "decklink",
+             "-list_formats", "1", "-i", device_name],
+            capture_output=True, text=True, timeout=5)
+        for line in result.stderr.splitlines():
+            # Lines like:  [decklink @ ...] 8       720x486 at 30000/1001 fps (interlaced, lower field first, 8 bit)     ntsc
+            # Or:          [decklink @ ...] 14      1920x1080 at 30000/1001 fps (progressive, 8 bit)     Hp30
+            if "[decklink" in line.lower() and "x" in line:
+                m = re.search(
+                    r"(\d{3,4})x(\d{3,5})\s+at\s+([\d/\.]+)\s+fps\s+"
+                    r"\(([^)]+)\)\s+(\S+)",
+                    line)
+                if m:
+                    w, h = m.group(1), m.group(2)
+                    fps_str = m.group(3)
+                    flags = m.group(4)
+                    code = m.group(5)
+                    # Build human-readable description
+                    try:
+                        if "/" in fps_str:
+                            num, den = fps_str.split("/", 1)
+                            fps = float(num) / float(den)
+                        else:
+                            fps = float(fps_str)
+                        fps_label = f"{fps:.2f}".rstrip("0").rstrip(".")
+                    except (ValueError, ZeroDivisionError):
+                        fps_label = fps_str
+                    scan = "i" if "interlaced" in flags else "p"
+                    desc = f"{w}x{h}{scan} {fps_label}fps"
+                    formats.append((code, desc))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return formats
 
 
 
@@ -391,6 +488,15 @@ class MonitorWindow(QWidget):
         refresh_btn.clicked.connect(self._do_refresh)
         tl.addWidget(refresh_btn)
 
+        # DeckLink format selector — hidden unless a DeckLink device is active
+        self._fmt_label = QLabel("Format:")
+        self._fmt_label.setVisible(False)
+        tl.addWidget(self._fmt_label)
+        self._fmt_combo = QComboBox()
+        self._fmt_combo.setMinimumWidth(160)
+        self._fmt_combo.setVisible(False)
+        tl.addWidget(self._fmt_combo)
+
         self._screenshot_btn = QPushButton("📷")
         self._screenshot_btn.setFixedWidth(28)
         self._screenshot_btn.setToolTip("Save screenshot")
@@ -427,6 +533,8 @@ class MonitorWindow(QWidget):
     def _do_refresh(self):
         self._video_lbl.setText("Scanning for capture devices...")
         self._status_lbl.setText("Scanning...")
+        self._fmt_combo.setVisible(False)
+        self._fmt_label.setVisible(False)
         QTimer.singleShot(50, self._refresh_sources)
 
     def _refresh_sources(self):
@@ -438,18 +546,17 @@ class MonitorWindow(QWidget):
         self._devices = []
         seen_names = set()
 
-        # 1. DeckLink (Blackmagic)
+        # 1. DeckLink via ffmpeg -f decklink (requires ffmpeg --enable-decklink)
         for d in _find_decklink_devices():
             if d[2] not in seen_names:
                 seen_names.add(d[2])
                 self._devices.append(d)
 
-        # 2. AVFoundation VIDEO capture cards only — use their video index for OpenCV
-        for d in _find_avfoundation_capture_cards():
-            if d[0] == "avf_video" and d[2] not in seen_names:
+        # 2. Capture cards via AVFoundation names + OpenCV index probing
+        for d in _find_capture_devices():
+            if d[2] not in seen_names:
                 seen_names.add(d[2])
-                # Store as cv2 type with the AVF video index — this is the correct index
-                self._devices.append(("cv2", d[1], d[2]))
+                self._devices.append(d)
 
         # Populate dropdown — clean names, no emojis
         if not self._devices:
@@ -457,8 +564,8 @@ class MonitorWindow(QWidget):
             self._status_lbl.setText("No devices")
             self._video_lbl.setText(
                 "No capture devices found\n\n"
-                "Supported: HDMI/SDI capture cards\n"
-                "(Blackmagic, Elgato, Magewell, etc.)")
+                "Cheap USB capture cards will be your friend.\n"
+                "Don't kill the reference!")
         else:
             self._source_combo.addItem("Select source", None)
             for i, d in enumerate(self._devices):
@@ -476,6 +583,8 @@ class MonitorWindow(QWidget):
                 self._source_combo.setItemText(i, self._devices[d][2])
         data = self._source_combo.currentData()
         if data is None or not isinstance(data, int) or data < 0:
+            self._fmt_combo.setVisible(False)
+            self._fmt_label.setVisible(False)
             return
         if data >= len(self._devices):
             return
@@ -483,6 +592,35 @@ class MonitorWindow(QWidget):
         # Green dot on active
         cur = self._source_combo.currentIndex()
         self._source_combo.setItemText(cur, f"\u2022 {dev[2]}")
+
+        if dev[0] == "decklink":
+            # Populate format selector for this DeckLink device
+            self._fmt_combo.blockSignals(True)
+            self._fmt_combo.clear()
+            self._fmt_combo.addItem("Auto-detect", None)
+            formats = _find_decklink_formats(dev[1])
+            for code, desc in formats:
+                self._fmt_combo.addItem(f"{desc}  ({code})", code)
+            self._fmt_combo.blockSignals(False)
+            self._fmt_combo.setVisible(True)
+            self._fmt_label.setVisible(True)
+            # Disconnect any prior connection, then connect
+            try:
+                self._fmt_combo.currentIndexChanged.disconnect()
+            except TypeError:
+                pass
+            self._fmt_combo.currentIndexChanged.connect(
+                lambda _: self._start_decklink_with_format(dev))
+            # Start capture with auto-detect
+            self._start_capture(dev)
+        else:
+            self._fmt_combo.setVisible(False)
+            self._fmt_label.setVisible(False)
+            self._start_capture(dev)
+
+    def _start_decklink_with_format(self, dev):
+        """Restart DeckLink capture with the selected format."""
+        self._stop_capture()
         self._start_capture(dev)
 
     def _start_capture(self, dev):
@@ -491,7 +629,9 @@ class MonitorWindow(QWidget):
         self._video_lbl.setText(f"Connecting to {dname}...")
 
         if dtype == "decklink":
-            self._cap_thread = _CaptureThread(did, dname, fmt="decklink")
+            fmt_code = self._fmt_combo.currentData() if self._fmt_combo.isVisible() else None
+            self._cap_thread = _CaptureThread(did, dname, fmt="decklink",
+                                              decklink_format=fmt_code)
         elif dtype == "cv2":
             self._cap_thread = _CaptureThread(did, dname, fmt="cv2")
         else:
@@ -538,14 +678,26 @@ class MonitorWindow(QWidget):
     def _check_started(self, dname):
         """Check if capture produced any frames after timeout."""
         if self._cap_thread and self._cap_thread._latest_id == 0:
-            err = getattr(self._ffmpeg_cap, 'error_msg', '')
+            err = getattr(self._cap_thread, 'error_msg', '')
             self._stop_capture()
-            self._video_lbl.setText(
-                f"Could not capture from {dname}\n\n"
-                f"This device may require FFmpeg with DeckLink support.\n"
-                f"Install: brew install ffmpeg (with --enable-decklink)\n"
-                f"Or use Blackmagic Media Express to verify the input signal."
-                + (f"\n\n{err}" if err else ""))
+            if self._source_type == "decklink" or "decklink" in dname.lower() \
+                    or "ultrastudio" in dname.lower():
+                hint = (
+                    f"Could not capture from {dname}\n\n"
+                    "Check:\n"
+                    "1. Blackmagic Desktop Video drivers are installed\n"
+                    "2. FFmpeg has DeckLink support "
+                    "(brew install ffmpeg --with-decklink)\n"
+                    "3. A valid signal is connected to the input\n"
+                    "4. Try selecting a specific format above "
+                    "to match your input signal")
+            else:
+                hint = (
+                    f"Could not capture from {dname}\n\n"
+                    "Check that the device is connected and has a signal.")
+            if err:
+                hint += f"\n\n{err}"
+            self._video_lbl.setText(hint)
             self._status_lbl.setText("Capture failed")
 
     def _take_screenshot(self):
