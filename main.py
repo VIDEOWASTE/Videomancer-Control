@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -4871,10 +4871,13 @@ class VideomancerApp(QMainWindow):
 
     def _hotplug_scan(self):
         """Periodically scan for device when not connected (hot-plug support)."""
-        if self._worker and self._worker.isRunning():
-            return  # already connected
-        self.conn_bar.refresh_ports()
-        self.conn_bar.try_auto_connect()
+        try:
+            if self._worker and self._worker.isRunning():
+                return  # already connected
+            self.conn_bar.refresh_ports()
+            self.conn_bar.try_auto_connect()
+        except Exception:
+            pass
 
     def _toggle_console(self):
         self._console_visible = not self._console_visible
@@ -5188,19 +5191,22 @@ class VideomancerApp(QMainWindow):
 
     def _update_uptime(self):
         """Update firmware panel with local connection uptime as fallback."""
-        if not hasattr(self, '_connected_at') or not self._worker:
-            return
-        elapsed = int(time.monotonic() - self._connected_at)
-        hours, rem = divmod(elapsed, 3600)
-        mins, secs = divmod(rem, 60)
-        if hours > 0:
-            text = f"{hours}h {mins}m"
-        else:
-            text = f"{mins}m {secs}s"
-        self.system_tab.apply_firmware_info(
-            version=self.system_tab._fw_fields["version"].text(),
-            uptime=text,
-        )
+        try:
+            if not hasattr(self, '_connected_at') or not self._worker:
+                return
+            elapsed = int(time.monotonic() - self._connected_at)
+            hours, rem = divmod(elapsed, 3600)
+            mins, secs = divmod(rem, 60)
+            if hours > 0:
+                text = f"{hours}h {mins}m"
+            else:
+                text = f"{mins}m {secs}s"
+            self.system_tab.apply_firmware_info(
+                version=self.system_tab._fw_fields["version"].text(),
+                uptime=text,
+            )
+        except Exception:
+            pass
 
     @pyqtSlot(dict)
     def _on_status_update(self, data: dict):
@@ -5309,19 +5315,24 @@ class VideomancerApp(QMainWindow):
     def _poll_device(self):
         """Poll device state for bidirectional sync every 250ms.
         Skip modulation polling while user is editing to prioritize sends."""
-        if not self._worker:
-            return
-        if not self._user_editing:
-            self._worker.send("modulation status")
-        if not hasattr(self, '_poll_count'):
-            self._poll_count = 0
-        self._poll_count += 1
-        if self._poll_count % 4 == 0:
-            self._worker.send("transport status")
-        if self._poll_count % 3 == 0 and not self._user_editing:
-            self._worker.send("program state")
-        if self._poll_count % 20 == 0:
-            self._worker.send("video status")
+        try:
+            if not self._worker:
+                return
+            if not self._user_editing:
+                self._worker.send("modulation status")
+            if not hasattr(self, '_poll_count'):
+                self._poll_count = 0
+            self._poll_count += 1
+            if self._poll_count % 4 == 0:
+                self._worker.send("transport status")
+            if self._poll_count % 3 == 0 and not self._user_editing:
+                self._worker.send("program state")
+            if self._poll_count % 20 == 0:
+                self._worker.send("video status")
+            if self._poll_count % 8 == 0:
+                self._worker.send("status")
+        except Exception:
+            pass
 
     def _request_state(self):
         if self._worker and not self._user_editing:
@@ -5660,17 +5671,18 @@ def main():
 
     # Global hot-plug watcher: spawn a new window when a new device appears
     def _global_hotplug():
-        all_ports = ConnectionBar.find_all_videomancer_ports()
-        unclaimed = [p for p in all_ports if p not in _claimed_ports]
-        # Only spawn if there's an unclaimed device AND every existing
-        # window already has a connection (avoids duplicate empty windows)
-        if unclaimed:
-            windows = list(_app_windows)  # copy to avoid mutation during iteration
-            all_connected = all(
-                w._worker and w._worker.isRunning() for w in windows
-            )
-            if all_connected:
-                _spawn_window(len(windows) + 1)
+        try:
+            all_ports = ConnectionBar.find_all_videomancer_ports()
+            unclaimed = [p for p in all_ports if p not in _claimed_ports]
+            if unclaimed:
+                windows = list(_app_windows)
+                all_connected = all(
+                    w._worker and w._worker.isRunning() for w in windows
+                )
+                if all_connected:
+                    _spawn_window(len(windows) + 1)
+        except Exception:
+            pass
 
     hotplug = QTimer()
     hotplug.setInterval(3000)
