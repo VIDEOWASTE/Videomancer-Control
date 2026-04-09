@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -3483,8 +3483,18 @@ class ConsoleWidget(QWidget):
         }
 
     def _copy_all(self):
-        from PyQt6.QtWidgets import QApplication
-        QApplication.clipboard().setText(self.text.toPlainText())
+        try:
+            from PyQt6.QtWidgets import QApplication
+            # Copy last 500 lines to avoid huge clipboard dumps
+            lines = self.text.toPlainText().splitlines()
+            text = "\n".join(lines[-500:])
+            QApplication.clipboard().setText(text)
+            # Flash "COPIED" on the button
+            if hasattr(self, '_copy_btn_ref') and self._copy_btn_ref:
+                self._copy_btn_ref.setText("COPIED")
+                QTimer.singleShot(1500, lambda: self._copy_btn_ref.setText("COPY"))
+        except Exception:
+            pass
 
     def _fmt(self, color: str):
         f = QTextCharFormat()
@@ -4676,7 +4686,8 @@ class VideomancerApp(QMainWindow):
         copy_btn.setFixedHeight(22)
         copy_btn.setFixedWidth(54)
         copy_btn.setStyleSheet(f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};border-radius:3px;color:{TEXT_DIM};font-size:10px;padding:0;}}QPushButton:hover{{color:{TEXT};}}")
-        copy_btn.clicked.connect(lambda: self.console.text.selectAll() or self.console._copy_all())
+        self._copy_btn = copy_btn
+        copy_btn.clicked.connect(lambda: self.console._copy_all())
         console_header.addWidget(copy_btn)
         clr_btn = QPushButton("CLEAR")
         clr_btn.setFixedHeight(22)
@@ -4699,6 +4710,7 @@ class VideomancerApp(QMainWindow):
         bl.addWidget(console_header_w)
 
         self.console = ConsoleWidget()
+        self.console._copy_btn_ref = copy_btn
         self.console.hide()
         bl.addWidget(self.console)
 
@@ -4874,6 +4886,9 @@ class VideomancerApp(QMainWindow):
         try:
             if self._worker and self._worker.isRunning():
                 return  # already connected
+            # Skip if a reconnect attempt is pending (avoid double-connect)
+            if getattr(self, '_reconnect_attempt', 0) > 0:
+                return
             self.conn_bar.refresh_ports()
             self.conn_bar.try_auto_connect()
         except Exception:
@@ -4910,6 +4925,7 @@ class VideomancerApp(QMainWindow):
 
     @pyqtSlot(str)
     def _on_connected(self, port: str):
+        self._reconnect_attempt = 0  # reset backoff on success
         # Port already claimed in _do_connect, just ensure it's set
         _claimed_ports.add(port)
         self._claimed_port = port
@@ -4936,6 +4952,8 @@ class VideomancerApp(QMainWindow):
 
     @pyqtSlot()
     def _on_disconnected(self):
+        # Remember the port for auto-reconnect
+        last_port = getattr(self, '_claimed_port', None)
         # Release claimed port
         if hasattr(self, '_claimed_port') and self._claimed_port:
             _claimed_ports.discard(self._claimed_port)
@@ -4952,7 +4970,7 @@ class VideomancerApp(QMainWindow):
         self.snap_tab.set_connected(False)
         label = self._window_label
         self.setWindowTitle(f"VIDEOMANCER CONTROL {label}")
-        self.status_bar.showMessage("Disconnected — waiting for device…")
+        self.status_bar.showMessage("Disconnected — reconnecting…")
         # Clear active program and switch to Programs tab (splash screen)
         self._active_program = None
         if hasattr(self, 'conn_bar') and hasattr(self.conn_bar, '_prog_lbl'):
@@ -4965,6 +4983,25 @@ class VideomancerApp(QMainWindow):
         self.console.append("log", "", "Serial connection closed")
         # Clear worker so hot-plug timer can reconnect
         self._worker = None
+        # Auto-reconnect: try the same port after a delay
+        # Use increasing backoff to avoid rapid reconnect loops
+        attempt = getattr(self, '_reconnect_attempt', 0) + 1
+        self._reconnect_attempt = attempt
+        delay = min(3000 + 2000 * attempt, 15000)  # 5s, 7s, 9s, ... 15s max
+        if last_port:
+            QTimer.singleShot(delay, lambda: self._try_reconnect(last_port))
+
+    def _try_reconnect(self, port: str):
+        """Attempt to reconnect to the last known port."""
+        if self._worker and self._worker.isRunning():
+            return  # already reconnected via hotplug
+        # Check if port still exists without opening it
+        from pathlib import Path
+        if not Path(port).exists():
+            self.status_bar.showMessage("Disconnected — waiting for device…")
+            return
+        self.status_bar.showMessage(f"Reconnecting to {port}…")
+        self._do_connect(port)
 
     @pyqtSlot(str)
     def _on_error(self, msg: str):

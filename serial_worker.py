@@ -76,8 +76,10 @@ class SerialWorker(QThread):
         self.connected.emit(self._port)
 
         # Wait for device to be ready — poll for data instead of fixed sleep.
-        # Most devices respond within 200-500ms; bail after 1.5s worst case.
-        deadline = time.monotonic() + 1.5
+        # Most devices respond within 200-500ms; bail after 2.5s worst case.
+        # After long connections, USB may need extra time to stabilise.
+        time.sleep(0.3)  # unconditional settle time
+        deadline = time.monotonic() + 2.5
         while time.monotonic() < deadline:
             try:
                 if self._serial.in_waiting > 0:
@@ -88,12 +90,26 @@ class SerialWorker(QThread):
         self._serial.reset_input_buffer()
         self._buf = b""
 
-        # Initial queries
-        for cmd in ["version", "status", "programs list",
-                    "modulation status", "transport status",
-                    "video status"]:
-            self._write(cmd + "\n")
-            time.sleep(0.03)
+        # Initial queries — retry once if the first attempt fails
+        init_cmds = ["version", "status", "programs list",
+                     "modulation status", "transport status",
+                     "video status"]
+        for attempt in range(2):
+            self._write_errors = 0
+            for cmd in init_cmds:
+                self._write(cmd + "\n")
+                if not self._running:
+                    break
+                time.sleep(0.03)
+            if self._running:
+                break  # success
+            # First attempt failed — reset and retry after a pause
+            if attempt == 0:
+                self._running = True
+                self._write_errors = 0
+                time.sleep(1.0)
+
+        _read_errors = 0
 
         while self._running:
             # 1. Send all queued commands
@@ -110,10 +126,16 @@ class SerialWorker(QThread):
                 waiting = self._serial.in_waiting
                 if waiting > 0:
                     self._buf += self._serial.read(waiting)
+                _read_errors = 0  # reset on success
             except Exception:
-                # Device was unplugged — exit cleanly
-                self._running = False
-                break
+                _read_errors += 1
+                if _read_errors >= 5:
+                    # Persistent failure — device likely unplugged
+                    self._running = False
+                    break
+                # Transient error (USB wake, etc.) — wait and retry
+                time.sleep(0.5)
+                continue
 
             # 3. Process all complete lines in buffer
             while b"\n" in self._buf:
@@ -123,7 +145,11 @@ class SerialWorker(QThread):
                 if line:
                     self._dispatch(line)
 
-            # 4. Short sleep to avoid burning CPU
+            # 4. Prevent buffer from growing unbounded
+            if len(self._buf) > 65536:
+                self._buf = self._buf[-8192:]
+
+            # 5. Short sleep to avoid burning CPU
             time.sleep(0.008)
 
         try:
@@ -137,12 +163,22 @@ class SerialWorker(QThread):
     # ------------------------------------------------------------------
 
     def _write(self, text: str):
+        if not self._running:
+            return
         try:
             self._serial.write(text.encode("ascii"))
             self._serial.flush()
+            self._write_errors = 0
         except Exception as exc:
-            self.error.emit(f"Write error: {exc}")
-            self._running = False  # unplug during write — stop loop
+            if not hasattr(self, '_write_errors'):
+                self._write_errors = 0
+            self._write_errors += 1
+            if self._write_errors >= 10:
+                self.error.emit(f"Write error: {exc}")
+                self._running = False
+            elif self._write_errors >= 3:
+                # Multiple failures — pause before next attempt
+                time.sleep(0.5)
 
     def _dispatch(self, line: str):
         if line.startswith("@"):
