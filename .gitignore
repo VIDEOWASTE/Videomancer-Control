@@ -7,3 +7,13 @@ build/
 *.egg-info/
 .DS_Store
 *.zip
+
+# Local version backups — equivalent content lives in git tags
+*_backup_v*.py
+
+# Unrelated projects that happen to live in this directory
+FairWaste/
+
+# macOS signing artifacts
+certificate.p12
+notarize.zip

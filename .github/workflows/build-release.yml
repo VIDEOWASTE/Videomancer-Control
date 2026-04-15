@@ -29,15 +29,80 @@ jobs:
             --add-data "fonts:fonts" \
             main.py
 
-      # TODO: Re-enable signing & notarization once certificate is fixed
-      # - name: Import signing certificate
-      # - name: Sign the app
-      # - name: Notarize the app
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k actions build.keychain
+          rm certificate.p12
+
+      - name: Sign the app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: Nathaniel Coleman ($APPLE_TEAM_ID)"
+          APP="dist/VideomancerControl.app"
+
+          # Sign all nested Mach-O binaries first (inside-out), then the bundle.
+          # --deep is deprecated; we walk the tree ourselves.
+          find "$APP/Contents" \( -name "*.dylib" -o -name "*.so" \) -print0 \
+            | xargs -0 -I {} codesign --force --timestamp --options runtime \
+                --sign "$IDENTITY" {}
+
+          # Sign embedded frameworks (Qt, Python)
+          if [ -d "$APP/Contents/Frameworks" ]; then
+            find "$APP/Contents/Frameworks" -type d -name "*.framework" -print0 \
+              | xargs -0 -I {} codesign --force --timestamp --options runtime \
+                  --sign "$IDENTITY" {}
+          fi
+
+          # Sign the main executable & the outer bundle with entitlements
+          codesign --force --timestamp --options runtime \
+            --entitlements entitlements.plist \
+            --sign "$IDENTITY" \
+            "$APP/Contents/MacOS/VideomancerControl" || true
+
+          codesign --force --timestamp --options runtime \
+            --entitlements entitlements.plist \
+            --sign "$IDENTITY" \
+            "$APP"
+
+          # Verify hardened runtime is enabled and signature is valid
+          codesign --verify --verbose=2 "$APP"
+          codesign -dv --entitlements - "$APP"
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent dist/VideomancerControl.app notarize.zip
+
+          xcrun notarytool submit notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          xcrun stapler staple dist/VideomancerControl.app
+          xcrun stapler validate dist/VideomancerControl.app
+          spctl --assess --type execute --verbose=2 dist/VideomancerControl.app || true
 
       - name: Create zip
         run: |
           cd dist
-          zip -r ../VideomancerControl_macOS_ARM.zip "VideomancerControl.app"
+          ditto -c -k --keepParent "VideomancerControl.app" ../VideomancerControl_macOS_ARM.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.3.1"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -5674,7 +5674,16 @@ def _spawn_window(number: int) -> VideomancerApp:
     return w
 
 
+def _global_exception_hook(exc_type, exc_value, exc_tb):
+    """Prevent PyQt6/Python 3.14 from calling abort() on unhandled exceptions.
+    Without this, any Python exception in a Qt slot triggers SIGABRT."""
+    import traceback
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+
 def main():
+    # Install global exception hook BEFORE creating QApplication
+    sys.excepthook = _global_exception_hook
+
     app = QApplication(sys.argv)
     app.setApplicationName("Videomancer Control")
     app.setOrganizationName("LZX Industries")

@@ -96,9 +96,10 @@ Produces `dist\VideomancerControl.exe`
 |------|---------|
 | `main.py` | Main application |
 | `serial_worker.py` | USB serial communication thread |
-| `setup.py` | py2app build config (macOS) |
-| `BUILD.sh` | macOS build script |
-| `BUILD_WIN.bat` | Windows build script |
+| `BUILD.sh` | macOS build script (PyInstaller) |
+| `BUILD_WIN.bat` | Windows build script (PyInstaller) |
+| `entitlements.plist` | Hardened-runtime entitlements for macOS signing |
+| `.github/workflows/build-release.yml` | CI: builds, signs, notarizes, releases |
 
 ---
 
