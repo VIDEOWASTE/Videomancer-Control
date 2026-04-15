@@ -93,7 +93,8 @@ jobs:
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
+            --wait \
+            --timeout 30m
 
           xcrun stapler staple dist/VideomancerControl.app
           xcrun stapler validate dist/VideomancerControl.app

@@ -10,7 +10,10 @@ Output:
 from setuptools import setup
 
 APP        = ['main.py']
-DATA_FILES = []
+DATA_FILES = [
+    ('fonts', ['fonts/goldplay-semibold.ttf',
+               'fonts/ReliefSingleLine-Regular.ttf']),
+]
 
 OPTIONS = {
     'argv_emulation': False,        # must be False for PyQt6
@@ -19,8 +22,8 @@ OPTIONS = {
         'CFBundleName':             'Videomancer Control',
         'CFBundleDisplayName':      'Videomancer Control',
         'CFBundleIdentifier':       'net.lzxindustries.videomancer-control',
-        'CFBundleVersion':          '2.3.1',
-        'CFBundleShortVersionString': '2.3.1',
+        'CFBundleVersion':          '2.3.2',
+        'CFBundleShortVersionString': '2.3.2',
         'NSHumanReadableCopyright': '© 2026 LZX Industries / Videowaste',
         'NSHighResolutionCapable':  True,
 
@@ -33,8 +36,6 @@ OPTIONS = {
     'packages': [
         'PyQt6',
         'serial',
-        'serial.tools',
-        'serial.tools.list_ports',
     ],
     'includes': [
         'PyQt6.QtCore',

@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -1599,21 +1599,22 @@ class KnobWidget(QWidget):
             self._smooth_timer.start()
 
     def _smooth_step(self):
-        """Timer-driven glide — only runs when animating."""
+        """Timer-driven glide — only runs when animating.
+        Glide factor calibrated so motion spreads across the ~350ms poll
+        interval (≈21 frames @ 60fps) instead of snapping in 3 frames and
+        stalling. Prevents the step/jump look when device values change."""
         if self._user_dragging:
             self._smooth_timer.stop()
             return
         diff = self._frac - self._display_frac
-        glide = 0.8
-        if abs(diff) > 0.001:
+        glide = 0.18
+        if abs(diff) > 0.0005:
             self._display_frac += diff * glide
             self.update()
-        elif self._display_frac != self._frac:
+        else:
             self._display_frac = self._frac
             self._tss_glide = False
             self.update()
-        else:
-            self._tss_glide = False
             self._smooth_timer.stop()  # settled — stop until needed
 
     def setRange(self, mn, mx):
@@ -1762,15 +1763,16 @@ class SmoothFader(QWidget):
             return
         target = float(self._value)
         diff = target - self._display_val
+        # Glide spread across the ~350ms poll interval (≈21 frames @ 60fps)
+        # so fader motion is continuous instead of snap-and-stall.
         if abs(diff) > 0.5:
-            self._display_val += diff * 0.8
-            self._velocity = 0.0
-            self.update()
-        elif self._display_val != target:
-            self._display_val = target
+            self._display_val += diff * 0.18
             self._velocity = 0.0
             self.update()
         else:
+            self._display_val = target
+            self._velocity = 0.0
+            self.update()
             self._timer.stop()
 
     def _frac(self):
@@ -1919,15 +1921,15 @@ class HorizontalFader(QWidget):
             return
         target = float(self._value)
         diff = target - self._display_val
+        # Glide calibrated to poll interval — matches SmoothFader/KnobWidget.
         if abs(diff) > 0.5:
-            self._display_val += diff * 0.8
-            self._velocity = 0.0
-            self.update()
-        elif self._display_val != target:
-            self._display_val = target
+            self._display_val += diff * 0.18
             self._velocity = 0.0
             self.update()
         else:
+            self._display_val = target
+            self._velocity = 0.0
+            self.update()
             self._timer.stop()
 
     def _frac(self):
@@ -3531,9 +3533,14 @@ class SnapshotManager:
     """
 
     def __init__(self, folder: Optional[Path] = None):
+        # Don't mkdir here — that eagerly touches ~/Documents at launch
+        # and triggers macOS TCC prompt before the user has done anything.
+        # The folder is created lazily on first save.
         self.folder = folder or (
             Path.home() / "Documents" / "VideomancerSnapshots"
         )
+
+    def _ensure_folder(self):
         self.folder.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -3558,12 +3565,17 @@ class SnapshotManager:
             data["sp"] = tss.get("sp", [0]*12)
             data["sl"] = tss.get("sl", [0]*12)
             data["sr"] = tss.get("sr", [0]*12)
+        self._ensure_folder()
         path = self.folder / fname
         path.write_text(json.dumps(data, indent=2))
         return path
 
     def list_snapshots(self) -> List[dict]:
         """Return metadata for all snapshots, newest first."""
+        # Don't touch ~/Documents if the folder doesn't exist yet —
+        # that would trigger macOS TCC prompt unnecessarily.
+        if not self.folder.exists():
+            return []
         results = []
         for p in sorted(self.folder.glob("*.json"), reverse=True):
             try:
@@ -3587,6 +3599,7 @@ class SnapshotManager:
 
     def open_folder(self):
         """Open the snapshots folder in Finder (macOS)."""
+        self._ensure_folder()
         os.system(f'open "{self.folder}"')
 
 
