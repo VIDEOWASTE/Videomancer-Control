@@ -21,7 +21,7 @@ jobs:
 
       - name: Build binary
         run: |
-          pyinstaller --onefile --windowed \
+          pyinstaller --onedir --windowed \
             --name "VideomancerControl" \
             --icon "icon.icns" \
             --hidden-import serial.tools.list_ports \
@@ -66,11 +66,11 @@ jobs:
                   --sign "$IDENTITY" {}
           fi
 
-          # Sign the main executable & the outer bundle with entitlements
-          codesign --force --timestamp --options runtime \
-            --entitlements entitlements.plist \
-            --sign "$IDENTITY" \
-            "$APP/Contents/MacOS/VideomancerControl" || true
+          # Sign all executables in MacOS/ (main + any helpers from onedir)
+          find "$APP/Contents/MacOS" -type f -perm +111 -print0 \
+            | xargs -0 -I {} codesign --force --timestamp --options runtime \
+                --entitlements entitlements.plist \
+                --sign "$IDENTITY" {}
 
           codesign --force --timestamp --options runtime \
             --entitlements entitlements.plist \
