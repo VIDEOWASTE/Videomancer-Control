@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.3.4"
+APP_VERSION = "2.4"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QStatusBar, QFrame, QSplitter, QTextEdit, QGroupBox,
     QTabWidget, QSlider, QCheckBox, QScrollArea, QGridLayout,
     QSizePolicy, QMessageBox, QInputDialog, QDialog, QDialogButtonBox,
+    QFileDialog,
 )
 import math
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QThread, QRectF, QPointF
@@ -1360,6 +1361,7 @@ class ProgramsTab(QWidget):
         self._highlight_active()
         if self._selected == name:
             self.active_pill.setVisible(True)
+            self.load_btn.setText("⬤  RELOAD PROGRAM")
         elif not self._selected:
             # Nothing selected — show the active program in the panel
             self.name_lbl.setText(name)
@@ -1367,6 +1369,12 @@ class ProgramsTab(QWidget):
             self.desc_lbl.setVisible(False)
             self.load_btn.setText("⬤  RELOAD PROGRAM")
             self.load_btn.setEnabled(self._connected)
+        else:
+            # Selected is a different program — right pane shows the selection,
+            # so the RUNNING pill (which describes the selected program) must
+            # be hidden, and the load button should offer to load, not reload.
+            self.active_pill.setVisible(False)
+            self.load_btn.setText("⬤  LOAD PROGRAM")
 
     def set_loading_program(self, loading: bool):
         self.loading_note.setVisible(loading)
@@ -3507,6 +3515,10 @@ class ConsoleWidget(QWidget):
         # Skip high-frequency modulation logs to prevent event loop flooding
         if key == "modulation" and prefix == "ok":
             return
+        # Harmless: firmware returns this after a program load when the
+        # program has no user presets yet. Not actionable, clutters the console.
+        if prefix == "error" and key == "1543503875":
+            return
         cursor = self.text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         ts   = time.strftime("%H:%M:%S")
@@ -3546,11 +3558,14 @@ class SnapshotManager:
     # ------------------------------------------------------------------
 
     def save(self, label: str, program: str, parameters: List[int],
-             presets: dict, settings: dict, tss: dict = None) -> Path:
-        """Write a snapshot file and return its path."""
+             presets: dict, settings: dict, tss: dict = None,
+             path: Optional[Path] = None) -> Path:
+        """Write a snapshot file and return its path.
+
+        If `path` is given, write there. Otherwise, auto-name in the default
+        snapshots folder.
+        """
         ts   = datetime.now()
-        slug = re.sub(r"[^\w\-]", "_", label.strip())[:40] or "snapshot"
-        fname = f"{ts.strftime('%Y%m%d_%H%M%S')}_{slug}.json"
         data  = {
             "version":    2,
             "timestamp":  ts.isoformat(),
@@ -3565,10 +3580,21 @@ class SnapshotManager:
             data["sp"] = tss.get("sp", [0]*12)
             data["sl"] = tss.get("sl", [0]*12)
             data["sr"] = tss.get("sr", [0]*12)
-        self._ensure_folder()
-        path = self.folder / fname
+        if path is None:
+            slug = re.sub(r"[^\w\-]", "_", label.strip())[:40] or "snapshot"
+            fname = f"{ts.strftime('%Y%m%d_%H%M%S')}_{slug}.json"
+            self._ensure_folder()
+            path = self.folder / fname
+        else:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2))
         return path
+
+    def default_filename(self, label: str) -> str:
+        ts = datetime.now()
+        slug = re.sub(r"[^\w\-]", "_", label.strip())[:40] or "snapshot"
+        return f"{ts.strftime('%Y%m%d_%H%M%S')}_{slug}.json"
 
     def list_snapshots(self) -> List[dict]:
         """Return metadata for all snapshots, newest first."""
@@ -3895,6 +3921,102 @@ def _timing_to_fps(timing: str) -> str:
     return table.get(t, f"{timing}")
 
 
+class _VMConfirmDialog(QDialog):
+    """Dark-themed confirmation dialog with Videomancer character as icon."""
+
+    def __init__(self, title: str, message: str, parent=None, buttons="yes_cancel",
+                 input_default: Optional[str] = None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.input: Optional[QLineEdit] = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 20, 20, 16)
+        root.setSpacing(14)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        icon_lbl.setStyleSheet("background:transparent;border:none;")
+        try:
+            from PyQt6.QtGui import QPixmap
+            from PyQt6.QtCore import QByteArray
+            raw = QByteArray.fromBase64(QByteArray(_SPLASH_IMG_B64.encode()))
+            pm = QPixmap()
+            pm.loadFromData(raw)
+            pm = _make_transparent(pm)
+            pm = pm.scaledToWidth(96, Qt.TransformationMode.SmoothTransformation)
+            icon_lbl.setPixmap(pm)
+        except Exception:
+            pass
+        body.addWidget(icon_lbl, alignment=Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(8)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            "color:#ffffff;font-size:18px;font-weight:bold;"
+            "letter-spacing:1px;background:transparent;border:none;"
+        )
+        text_col.addWidget(title_lbl)
+
+        msg_lbl = QLabel(message)
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setStyleSheet(
+            f"color:{TEXT};font-size:13px;background:transparent;border:none;"
+        )
+        text_col.addWidget(msg_lbl)
+
+        if input_default is not None:
+            self.input = QLineEdit(input_default)
+            self.input.selectAll()
+            text_col.addWidget(self.input)
+
+        text_col.addStretch(1)
+
+        body.addLayout(text_col, stretch=1)
+        root.addLayout(body, stretch=1)
+
+        if buttons == "ok":
+            btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, parent=self)
+            btn_box.accepted.connect(self.accept)
+        elif buttons == "ok_cancel":
+            btn_box = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+                parent=self,
+            )
+            btn_box.accepted.connect(self.accept)
+            btn_box.rejected.connect(self.reject)
+        else:
+            btn_box = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Yes | QDialogButtonBox.StandardButton.Cancel,
+                parent=self,
+            )
+            btn_box.accepted.connect(self.accept)
+            btn_box.rejected.connect(self.reject)
+        root.addWidget(btn_box, alignment=Qt.AlignmentFlag.AlignRight)
+
+    @classmethod
+    def ask(cls, parent, title: str, message: str) -> bool:
+        return cls(title, message, parent=parent).exec() == QDialog.DialogCode.Accepted
+
+    @classmethod
+    def notify(cls, parent, title: str, message: str) -> None:
+        cls(title, message, parent=parent, buttons="ok").exec()
+
+    @classmethod
+    def ask_text(cls, parent, title: str, message: str, default: str = "") -> Optional[str]:
+        dlg = cls(title, message, parent=parent, buttons="ok_cancel", input_default=default)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.input is not None:
+            return dlg.input.text()
+        return None
+
+
 class SystemTab(QWidget):
     """
     System settings — video routing, status, firmware, MIDI.
@@ -3916,6 +4038,7 @@ class SystemTab(QWidget):
         # ── Top bar ──
         top = QHBoxLayout()
         title = QLabel("SYSTEM")
+        title.setFixedHeight(32)
         title.setStyleSheet(
             f"color:#ffffff;font-family:'Goldplay',sans-serif;"
             f"font-size:22px;font-weight:bold;"
@@ -3924,6 +4047,7 @@ class SystemTab(QWidget):
         top.addWidget(title)
         top.addStretch()
         self.refresh_btn = QPushButton("↻  Refresh All")
+        self.refresh_btn.setFixedHeight(32)
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.clicked.connect(self._refresh)
         top.addWidget(self.refresh_btn)
@@ -4061,12 +4185,6 @@ class SystemTab(QWidget):
             sl.addLayout(row)
             self._status_fields[key] = val
 
-        sl.addSpacing(40)
-        self.refresh_status_btn = QPushButton("Refresh Status")
-        self.refresh_status_btn.setEnabled(False)
-        self.refresh_status_btn.clicked.connect(self._fetch_status)
-        sl.addWidget(self.refresh_status_btn)
-
         ll.addWidget(status_grp)
         ll.addStretch()
         splitter.addWidget(left)
@@ -4086,7 +4204,6 @@ class SystemTab(QWidget):
         for label, key in [
             ("Version",     "version"),
             ("Device",      "device"),
-            ("Serial",      "serial"),
             ("Uptime",      "uptime"),
         ]:
             row = QHBoxLayout()
@@ -4099,11 +4216,47 @@ class SystemTab(QWidget):
             fl.addLayout(row)
             self._fw_fields[key] = val
 
-        self.refresh_fw_btn = QPushButton("Refresh")
-        self.refresh_fw_btn.setEnabled(False)
-        self.refresh_fw_btn.clicked.connect(self._fetch_version)
-        fl.addWidget(self.refresh_fw_btn)
         rl.addWidget(fw_grp)
+
+        # ·· Storage (SD card as USB mass storage) ··
+        storage_grp = QGroupBox("STORAGE")
+        stg = QVBoxLayout(storage_grp)
+        stg.setSpacing(6)
+
+        storage_note = QLabel(
+            "Mount the Videomancer's SD card as a USB drive on your computer "
+            "to sideload programs or back up snapshots."
+        )
+        storage_note.setStyleSheet(f"color:{TEXT_DIM};font-size:13px;{self._TRANSPARENT}")
+        storage_note.setWordWrap(True)
+        stg.addWidget(storage_note)
+
+        self.msd_btn = QPushButton("MOUNT AS USB DRIVE")
+        self.msd_btn.setEnabled(False)
+        self.msd_btn.clicked.connect(self._on_msd_click)
+        stg.addWidget(self.msd_btn)
+
+        self._msd_state = "idle"  # idle | waiting | mounted
+        # Failsafe: optimistically promote waiting → mounted after 15 s
+        # if no `{"active":true}` arrives (USB re-enum can delay replies).
+        self._msd_wait_timer = QTimer(self)
+        self._msd_wait_timer.setSingleShot(True)
+        self._msd_wait_timer.setInterval(15000)
+        self._msd_wait_timer.timeout.connect(self._msd_wait_timeout)
+        # Promotion delay: once the device says `{"active":true}`, keep
+        # showing MOUNTING… for a few more seconds to line up with when
+        # the drive actually appears in Finder on the host side.
+        self._msd_promote_timer = QTimer(self)
+        self._msd_promote_timer.setSingleShot(True)
+        self._msd_promote_timer.setInterval(4000)
+        self._msd_promote_timer.timeout.connect(self._promote_msd_if_waiting)
+        # Polls `msd status` every 2 s so the UI tracks true device state
+        # from `{"active":true/false}`.
+        self._msd_poll_timer = QTimer(self)
+        self._msd_poll_timer.setInterval(2000)
+        self._msd_poll_timer.timeout.connect(self._msd_poll_status)
+
+        rl.addWidget(storage_grp)
 
         # ·· MIDI CC map ··
         midi_grp = QGroupBox("MIDI CC ASSIGNMENTS")
@@ -4116,10 +4269,6 @@ class SystemTab(QWidget):
             f"border:1px solid {BORDER};border-radius:4px;"
         )
         ml.addWidget(self.midi_table)
-        self.refresh_midi_btn = QPushButton("Refresh CC Map")
-        self.refresh_midi_btn.setEnabled(False)
-        self.refresh_midi_btn.clicked.connect(self._fetch_midi)
-        ml.addWidget(self.refresh_midi_btn)
         rl.addWidget(midi_grp)
 
         # ·· Documentation ··
@@ -4157,9 +4306,13 @@ class SystemTab(QWidget):
     def set_connected(self, v: bool):
         self._connected = v
         self.refresh_btn.setEnabled(v)
-        self.refresh_status_btn.setEnabled(v)
-        self.refresh_midi_btn.setEnabled(v)
-        self.refresh_fw_btn.setEnabled(v)
+        if not v:
+            self._msd_state = "idle"
+            self._msd_wait_timer.stop()
+            self._msd_promote_timer.stop()
+            self._msd_poll_timer.stop()
+            self.msd_btn.setText("MOUNT AS USB DRIVE")
+        self.msd_btn.setEnabled(v and self._msd_state == "idle")
         self.src_combo.setEnabled(v)
         self._src_hdmi_btn.setEnabled(v)
         self._src_analog_btn.setEnabled(v)
@@ -4265,11 +4418,10 @@ class SystemTab(QWidget):
             self.on_send(f"video input {src}")
 
     def apply_firmware_info(self, version: str, device: str = "",
-                            serial_num: str = "", uptime: str = ""):
+                            uptime: str = ""):
         """Populate the firmware info fields."""
         self._fw_fields["version"].setText(version or "\u2014")
         self._fw_fields["device"].setText(device or "Videomancer")
-        self._fw_fields["serial"].setText(serial_num or "\u2014")
         self._fw_fields["uptime"].setText(uptime or "\u2014")
 
     def _refresh(self):
@@ -4288,6 +4440,104 @@ class SystemTab(QWidget):
     def _fetch_version(self):
         if self.on_send and self._connected:
             self.on_send("version")
+
+    def _on_msd_click(self):
+        if self._msd_state == "idle":
+            self._start_mount()
+
+    def _start_mount(self):
+        if not _VMConfirmDialog.ask(
+            self,
+            "Mount SD Card",
+            "Mount the Videomancer's SD card as a USB drive?\n\n"
+            "Program loading and snapshots will be unavailable until the "
+            "card is ejected in Finder. Allow up to 15 seconds for the "
+            "drive to appear.",
+        ):
+            return
+        if not self.on_send:
+            return
+        self._msd_state = "waiting"
+        self.msd_btn.setEnabled(False)
+        self.msd_btn.setText("MOUNTING…")
+        self.on_send("msd enter")
+        self._msd_wait_timer.start()
+        self._msd_poll_timer.start()
+
+    def _msd_wait_timeout(self):
+        """No `{"active":true}` within 15 s — mount failed, revert."""
+        if self._msd_state == "waiting":
+            self._set_msd_idle()
+            _VMConfirmDialog.notify(
+                self,
+                "Mount Failed",
+                "The Videomancer did not enter USB mass storage mode within "
+                "15 seconds.\n\nLoad a program on the device first, then try "
+                "again. If that doesn't help, power-cycle the device "
+                "(unplug USB, wait 5 s, replug).",
+            )
+
+    def _promote_msd_if_waiting(self):
+        if self._msd_state == "waiting":
+            self._set_msd_mounted()
+
+    def _set_msd_mounted(self):
+        self._msd_wait_timer.stop()
+        self._msd_promote_timer.stop()
+        self._msd_state = "mounted"
+        # Button is passive while mounted — only way out is an eject in Finder
+        self.msd_btn.setEnabled(False)
+        self.msd_btn.setText("MOUNTED  —  EJECT IN FINDER TO RETURN")
+        if not self._msd_poll_timer.isActive():
+            self._msd_poll_timer.start()
+
+    def _set_msd_idle(self):
+        self._msd_wait_timer.stop()
+        self._msd_promote_timer.stop()
+        self._msd_poll_timer.stop()
+        self._msd_state = "idle"
+        self.msd_btn.setEnabled(self._connected)
+        self.msd_btn.setText("MOUNT AS USB DRIVE")
+
+    def _msd_poll_status(self):
+        if self.on_send and self._connected and self._msd_state in (
+            "waiting", "mounted",
+        ):
+            self.on_send("msd status")
+
+    def apply_msd_response(self, prefix: str, payload: str):
+        """Handle @msd: / !msd: responses from the device.
+
+        The device emits:
+          - `{"status":"entering"}` / `{"status":"exiting"}` — command acks, no state change
+          - `{"active":true}` / `{"active":false}` — authoritative status from `msd status`
+
+        Only `active` drives state transitions. Command acks are ignored so the
+        button doesn't flip instantly on the echo of `msd enter`.
+        """
+        if prefix == "error":
+            self._set_msd_idle()
+            return
+
+        lower = (payload or "").strip().lower()
+
+        if '"active":true' in lower:
+            if self._msd_state == "waiting":
+                # Delay promotion so the UI waits for the drive to actually
+                # appear in Finder (OS enumeration lags firmware by a few s).
+                if not self._msd_promote_timer.isActive():
+                    self._msd_promote_timer.start()
+            return
+
+        if '"active":false' in lower:
+            # Only treat as eject if we were actually mounted. While "waiting"
+            # the device is still transitioning — polls often return false for
+            # several seconds before flipping to true, and treating them as an
+            # exit would cancel our own mount.
+            if self._msd_state == "mounted":
+                self._set_msd_idle()
+            return
+        # Any other payload (e.g. `{"status":"entering"}`) is just an ack — ignore.
 
     def _open_doc(self, url: str):
         from PyQt6.QtGui import QDesktopServices
@@ -4324,6 +4574,7 @@ class StateTab(QWidget):
 
         top = QHBoxLayout()
         title = QLabel("STATE")
+        title.setFixedHeight(32)
         title.setStyleSheet(
             f"color:#ffffff;font-family:'Goldplay',sans-serif;"
             f"font-size:22px;font-weight:bold;"
@@ -4332,6 +4583,7 @@ class StateTab(QWidget):
         top.addWidget(title)
         top.addStretch()
         self.refresh_btn = QPushButton("↻  Refresh")
+        self.refresh_btn.setFixedHeight(32)
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setVisible(False)
         self.refresh_btn.clicked.connect(lambda: self.on_refresh and self.on_refresh())
@@ -4349,8 +4601,8 @@ class StateTab(QWidget):
         ll.setContentsMargins(0, 0, 8, 0)
         ll.setSpacing(10)
 
-        # User presets
-        user_grp = QGroupBox("User Presets")
+        # User states (LZX's term for what we internally call user presets)
+        user_grp = QGroupBox("User States")
         ul = QVBoxLayout(user_grp)
         self.user_list = QListWidget()
         self.user_list.setMaximumHeight(160)
@@ -4372,10 +4624,65 @@ class StateTab(QWidget):
         ul.addLayout(user_btns)
 
         self.flash_lbl = QLabel("")
-        self.flash_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;")
+        self.flash_lbl.setStyleSheet(
+            f"color:{TEXT_DIM};font-size:14px;"
+            f"background:transparent;border:none;"
+        )
         ul.addWidget(self.flash_lbl)
         ll.addWidget(user_grp)
+
         ll.addStretch()
+
+        # ·· Preset / Snapshot explainer ··
+        _title_css = (
+            f"color:#ffffff;font-size:15px;font-weight:bold;"
+            f"letter-spacing:2px;background:transparent;border:none;"
+        )
+        _body_css = (
+            f"color:{TEXT};font-size:14px;line-height:150%;"
+            f"background:transparent;border:none;"
+        )
+
+        def _accent_line():
+            line = QFrame()
+            line.setFrameShape(QFrame.Shape.HLine)
+            line.setFixedHeight(2)
+            line.setFixedWidth(60)
+            line.setStyleSheet(
+                f"background:{ACCENT2};border:none;color:{ACCENT2};"
+            )
+            return line
+
+        preset_title = QLabel("STATE")
+        preset_title.setStyleSheet(_title_css)
+        preset_body = QLabel(
+            "A saved snapshot of Motion and Parameter values for the "
+            "currently loaded program, stored on the device."
+        )
+        preset_body.setWordWrap(True)
+        preset_body.setStyleSheet(_body_css)
+
+        snap_title = QLabel("SNAPSHOT")
+        snap_title.setStyleSheet(_title_css)
+        snap_body = QLabel(
+            "A local JSON file on this computer capturing the current program "
+            "+ its user states + global settings. Use it to back up or share "
+            "a full session."
+        )
+        snap_body.setWordWrap(True)
+        snap_body.setStyleSheet(_body_css)
+
+        ll.addWidget(preset_title)
+        ll.addWidget(_accent_line())
+        ll.addSpacing(4)
+        ll.addWidget(preset_body)
+        ll.addSpacing(12)
+        ll.addWidget(snap_title)
+        ll.addWidget(_accent_line())
+        ll.addSpacing(4)
+        ll.addWidget(snap_body)
+        ll.addSpacing(4)
+
         splitter.addWidget(left)
 
         # ── Right: File snapshots ──
@@ -4421,7 +4728,10 @@ class StateTab(QWidget):
         sl.addLayout(snap_btns)
 
         self.snap_status = QLabel("")
-        self.snap_status.setStyleSheet(f"color:{WARN};font-size:11px;")
+        self.snap_status.setStyleSheet(
+            f"color:{WARN};font-size:11px;"
+            f"background:transparent;border:none;"
+        )
         sl.addWidget(self.snap_status)
 
         rl.addWidget(snap_grp, stretch=1)
@@ -4490,9 +4800,20 @@ class StateTab(QWidget):
             self.on_apply_user(items[0].data(Qt.ItemDataRole.UserRole))
 
     def _save_preset(self):
-        name, ok = QInputDialog.getText(self, "Save Preset", "Name:", text="My Preset")
-        if ok and name.strip() and self.on_save_preset:
-            self.on_save_preset(len(self._user), name.strip())
+        name = _VMConfirmDialog.ask_text(
+            self,
+            "Save State",
+            "Name this state. The firmware CLI is space-separated, so spaces "
+            "in the name will be replaced with underscores.",
+            default="My_State",
+        )
+        if name is None:
+            return
+        # Firmware splits the command on whitespace — a space in the name would
+        # be parsed as the start of the m:/t:/... payload and corrupt the save.
+        sanitized = name.strip().replace(" ", "_")
+        if sanitized and self.on_save_preset:
+            self.on_save_preset(len(self._user), sanitized)
 
     def _delete_preset(self):
         items = self.user_list.selectedItems()
@@ -4500,9 +4821,9 @@ class StateTab(QWidget):
             return
         idx  = items[0].data(Qt.ItemDataRole.UserRole)
         name = items[0].text()
-        if QMessageBox.question(self, "Delete", f'Delete "{name}"?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) == QMessageBox.StandardButton.Yes and self.on_delete_preset:
+        if _VMConfirmDialog.ask(
+            self, "Delete State", f'Delete "{name}"?'
+        ) and self.on_delete_preset:
             self.on_delete_preset(idx)
 
     def _save_snapshot(self):
@@ -4514,10 +4835,24 @@ class StateTab(QWidget):
             self.on_capture(label)
 
     def populate_for_save(self, label, program, parameters, presets, settings, tss=None):
-        self._manager.save(label, program, parameters, presets, settings, tss=tss)
-        self._reload_snapshots()
+        # Ensure default folder exists so Save As opens somewhere sensible.
+        self._manager._ensure_folder()
+        default_path = self._manager.folder / self._manager.default_filename(label)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Snapshot As",
+            str(default_path),
+            "Videomancer Snapshot (*.json);;All Files (*)",
+        )
         self._save_snap_btn.setEnabled(self._connected)
-        self.set_snapshot_status(f"✓ Saved: {label}")
+        if not path:
+            self.set_snapshot_status("Save cancelled")
+            return
+        saved = self._manager.save(
+            label, program, parameters, presets, settings, tss=tss, path=Path(path),
+        )
+        self._reload_snapshots()
+        self.set_snapshot_status(f"✓ Saved: {saved.name}")
 
     def _restore_snapshot(self):
         items = self.snap_list.selectedItems()
@@ -4526,10 +4861,13 @@ class StateTab(QWidget):
         s = items[0].data(Qt.ItemDataRole.UserRole)
         if not s:
             return
-        if QMessageBox.question(self, "Restore",
-            f'Restore "{s["label"]}" to device?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) == QMessageBox.StandardButton.Yes and self.on_restore:
+        prog = s.get("program") or s.get("data", {}).get("program") or "—"
+        msg = (
+            f'Restore "{s["label"]}"?\n\n'
+            f'This will load program "{prog}" and overwrite the device\'s '
+            f'current parameters, user states, and settings.'
+        )
+        if _VMConfirmDialog.ask(self, "Restore Snapshot", msg) and self.on_restore:
             self._restore_btn.setEnabled(False)
             self.on_restore(s["data"])
 
@@ -4540,10 +4878,9 @@ class StateTab(QWidget):
         s = items[0].data(Qt.ItemDataRole.UserRole)
         if not s:
             return
-        if QMessageBox.question(self, "Delete",
-            f'Delete snapshot "{s["label"]}"?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) == QMessageBox.StandardButton.Yes:
+        if _VMConfirmDialog.ask(
+            self, "Delete Snapshot", f'Delete snapshot "{s["label"]}"?'
+        ):
             self._manager.delete(s["path"])
             self._reload_snapshots()
 
@@ -4568,6 +4905,11 @@ class VideomancerApp(QMainWindow):
         self._worker: Optional[SerialWorker] = None
         self._active_program: Optional[str] = None
         self._pending_load: Optional[str] = None
+        self._suppress_poof = False   # skip load animation during snapshot restore
+        # Monotonic timestamp: while time.monotonic() < this, status polls that
+        # disagree with _active_program are ignored so a slow device switch
+        # can't revert the UI after a manual snapshot restore / load.
+        self._active_program_lock_until: float = 0.0
         self._user_editing = False      # True while user is actively moving controls
         self._edit_cooldown = QTimer()  # delay before re-syncing from device
         self._edit_cooldown.setSingleShot(True)
@@ -5055,6 +5397,11 @@ class VideomancerApp(QMainWindow):
                 self.status_bar.showMessage("Transport: stopped", 2000)
             return
 
+        # MSD responses need both ok and error prefixes handled.
+        if key == "msd":
+            self.system_tab.apply_msd_response(prefix, payload)
+            return
+
         if prefix != "ok":
             return
 
@@ -5264,7 +5611,23 @@ class VideomancerApp(QMainWindow):
         vstd = data.get("video_standard", "")
         sd   = "  SD●" if data.get("sd_mounted") else ""
         if prog:
-            self._set_active_program(prog)
+            # Drop stale status that disagrees with a manual set (snapshot
+            # restore, Load button) while the lock window is still active.
+            locked = (
+                time.monotonic() < self._active_program_lock_until
+                and prog != self._active_program
+            )
+            pending_mismatch = self._pending_load and prog != self._pending_load
+            if locked or pending_mismatch:
+                reason = "locked" if locked else "pending-mismatch"
+                self.console.append("log", "",
+                    f"[status] ignore current_program={prog!r} active={self._active_program!r} ({reason})")
+            else:
+                # If this status confirms our pending load, clear the flag so
+                # future unrelated status updates don't keep being blocked.
+                if self._pending_load and prog == self._pending_load:
+                    self._pending_load = None
+                self._set_active_program(prog)
         if vstd:
             self._sb_vid.setText(
                 f"Video: {vstd.replace('_', ' ').upper()}{sd}"
@@ -5272,8 +5635,6 @@ class VideomancerApp(QMainWindow):
         # If firmware reports uptime, use it instead of local timer
         if "uptime" in data:
             self.system_tab._fw_fields["uptime"].setText(str(data["uptime"]))
-        if "serial" in data:
-            self.system_tab._fw_fields["serial"].setText(str(data["serial"]))
         if "device" in data:
             self.system_tab._fw_fields["device"].setText(str(data["device"]))
 
@@ -5314,6 +5675,8 @@ class VideomancerApp(QMainWindow):
 
     def _trigger_poof(self):
         """Fire the poof + sparkle animation centered on the RUNNING pill."""
+        if self._suppress_poof:
+            return
         size = self.centralWidget().size()
         self._poof.resize(size)
         self._sparkle.resize(size)
@@ -5331,7 +5694,13 @@ class VideomancerApp(QMainWindow):
         self._sparkle.trigger(cx, cy)
 
     def _set_active_program(self, name: str):
+        if name != self._active_program:
+            self.console.append("log", "", f"[active] {self._active_program!r} → {name!r}")
         self._active_program = name
+        # Lock window: keep status polls from reverting this for 15 seconds.
+        # Polls that match `name` pass through and reset the lock; polls
+        # reporting a different program are ignored until the device catches up.
+        self._active_program_lock_until = time.monotonic() + 15.0
         self.prog_tab.set_active(name)
         self.param_tab.set_program(name)
         self.state_tab.set_snapshot_status("")
@@ -5527,6 +5896,9 @@ class VideomancerApp(QMainWindow):
         presets    = data.get("presets", {})
         settings   = data.get("settings", {})
 
+        self.console.append("log", "",
+            f"[restore] snapshot program={program!r} current_active={self._active_program!r}")
+
         self.state_tab.set_snapshot_status(f"Restoring: loading {program}…")
 
         def _abort_restore(msg="Restore aborted — device disconnected"):
@@ -5586,16 +5958,27 @@ class VideomancerApp(QMainWindow):
             self.state_tab._restore_btn.setEnabled(True)
             self.status_bar.showMessage("Snapshot restored", 4000)
             QTimer.singleShot(4000, lambda: self.state_tab.set_snapshot_status(""))
+            # Belt-and-suspenders: ensure the Programs tab reflects the snapshot's
+            # program even if the @program:ok ack didn't land.
+            if program:
+                self._set_active_program(program)
+            # Leave _pending_load set — it gets cleared in _on_status_update
+            # once the device confirms `current_program` matches. That keeps
+            # stale status replies from reverting the UI indefinitely.
             if self._worker:
                 self._fetch_presets()
+            # Re-enable the load animation for future manual program loads.
+            self._suppress_poof = False
 
         # Load program first, then chain the rest
         if program:
+            self._suppress_poof = True   # no spell animation during restore
             self._pending_load = program
             self._worker.load_program(program)
-            # After program loads (~2 s) the existing _on_response handler
-            # fires → calls _request_state + _fetch_presets.
-            # We override that flow for restore by using a one-shot timer.
+            # Optimistically update the active-program UI immediately so the
+            # Programs tab reflects the snapshot target. Status polls racing
+            # with a slow device switch won't revert it — see _on_status_update.
+            self._set_active_program(program)
             QTimer.singleShot(2200, step2)
         else:
             step2()
