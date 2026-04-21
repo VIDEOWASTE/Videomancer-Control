@@ -113,33 +113,43 @@ jobs:
 
 
   build-macos-intel:
-    # Intel build: macos-13-large is an x86_64 runner with better queue
-    # availability than the free macos-13 (which has become very constrained
-    # as GitHub pushes users toward Apple Silicon). Large runners are free
-    # on public repos. PyQt6-Qt6's x86_64 wheel is picked up natively so
-    # the whole bundle is Intel-native.
-    runs-on: macos-13-large
+    # Free Intel macOS runners (macos-13) have essentially no available
+    # capacity, and "-large" variants aren't free on public repos. Instead,
+    # run on the plentiful macos-latest (ARM) runner and drive everything
+    # through Rosetta 2 using a native x86_64 Python. PyInstaller running
+    # under Rosetta picks the x86_64 PyQt6-Qt6 wheel and produces a
+    # Intel-native .app. Rosetta 2 is pre-installed on GitHub macOS runners.
+    runs-on: macos-latest
+    env:
+      X64_PY: /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-          architecture: x64
+      - name: Install x86_64 Python via Rosetta
+        run: |
+          # Download the universal2 python.org installer (includes x86_64)
+          curl -sSfL -o python.pkg \
+            https://www.python.org/ftp/python/3.12.8/python-3.12.8-macos11.pkg
+          sudo installer -pkg python.pkg -target /
+          # Verify — x86_64 binary running under Rosetta 2
+          arch -x86_64 "$X64_PY" -c "import platform, sys; print('Python', sys.version.split()[0], platform.machine())"
 
-      - name: Install dependencies
-        run: pip install PyQt6 pyserial pyinstaller
+      - name: Install dependencies (x86_64)
+        run: |
+          arch -x86_64 "$X64_PY" -m pip install --upgrade pip
+          arch -x86_64 "$X64_PY" -m pip install PyQt6 pyserial pyinstaller
 
       - name: Build binary (x86_64)
         run: |
-          pyinstaller --onedir --windowed \
+          arch -x86_64 "$X64_PY" -m PyInstaller --onedir --windowed \
             --name "Videomancer Control" \
             --icon "icon.icns" \
             --hidden-import serial.tools.list_ports \
             --collect-submodules PyQt6 \
             --add-data "fonts:fonts" \
             main.py
+          # Sanity check — main exe should be x86_64
+          file "dist/Videomancer Control.app/Contents/MacOS/Videomancer Control"
 
       - name: Import signing certificate
         env:

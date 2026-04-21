@@ -8,7 +8,7 @@ The end-user-facing doc is `README.md` — keep user install / usage instruction
 
 ## Two unrelated projects share this directory
 
-1. **Videomancer Control** — everything at the root. Python 3.10+/PyQt6 desktop companion app for LZX Industries' Videomancer hardware. Ships as a signed+notarized macOS `.app` and Windows `.exe`. Current version: **2.4.4** (see `APP_VERSION` in `main.py`).
+1. **Videomancer Control** — everything at the root. Python 3.10+/PyQt6 desktop companion app for LZX Industries' Videomancer hardware. Ships as a signed+notarized macOS `.app` and Windows `.exe`. Current version: **2.4.5** (see `APP_VERSION` in `main.py`).
 2. **FairWaste/** — self-contained Swift/Metal iOS+macOS project (camera-input real-time frame store). No code dependency on Videomancer; they just share a parent folder.
 
 ---
