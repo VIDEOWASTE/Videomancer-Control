@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.4.5"
+APP_VERSION = "2.5"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys

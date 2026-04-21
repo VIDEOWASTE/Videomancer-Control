@@ -288,6 +288,16 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
+            ### Highlights since v2.4
+            - **Native Intel Mac support** — separate Intel zip, chosen automatically by the in-app updater.
+            - **In-app auto-updater** — detects new releases, downloads in place, restarts into the update.
+            - **Move to Applications prompt** on first launch from Downloads/Desktop.
+            - **TSS (Time / Space / Slope) glide** matches the main parameter knobs — no more choppy catch-up.
+            - **LFO waveform visualization** — each modulator type (Audio Input, Step Seq, Random, etc.) renders in its own style.
+            - **rc16 firmware compatibility** — Audio Input at the new operator ID.
+            - **Snapshot polish** — Save As dialog, restore confirmation shows the target program, no lingering "both programs running" artifact, VM-character confirmation dialogs replacing stock Qt popups.
+            - **App version shown in the System tab**; bundle is now "Videomancer Control.app" with a space.
+
             ### Downloads
             - **macOS (Apple Silicon)**: `VideomancerControl_macOS.zip` — M1 / M2 / M3 / M4.
             - **macOS (Intel)**: `VideomancerControl_macOS_Intel.zip` — Intel-based Macs.
