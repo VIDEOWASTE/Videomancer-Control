@@ -113,10 +113,12 @@ jobs:
 
 
   build-macos-intel:
-    # Intel build runs on the last macOS Intel runner so PyQt6-Qt6's
-    # x86_64 wheel is picked up natively. Ships as a second zip; the
-    # in-app updater chooses between the two based on platform.machine().
-    runs-on: macos-13
+    # Intel build: macos-13-large is an x86_64 runner with better queue
+    # availability than the free macos-13 (which has become very constrained
+    # as GitHub pushes users toward Apple Silicon). Large runners are free
+    # on public repos. PyQt6-Qt6's x86_64 wheel is picked up natively so
+    # the whole bundle is Intel-native.
+    runs-on: macos-13-large
     steps:
       - uses: actions/checkout@v5
 
