@@ -24,6 +24,7 @@ jobs:
           pyinstaller --onedir --windowed \
             --name "Videomancer Control" \
             --icon "icon.icns" \
+            --target-architecture universal2 \
             --hidden-import serial.tools.list_ports \
             --collect-submodules PyQt6 \
             --add-data "fonts:fonts" \
@@ -176,7 +177,7 @@ jobs:
             - **Polish** — app version shown in System tab, custom dark confirmation dialogs with the Videomancer character, console noise reduced, tab title spacing locked.
 
             ### Downloads
-            - **macOS**: `VideomancerControl_macOS.zip` — Apple Silicon native (M1/M2/M3/M4). Intel Macs can run via Rosetta.
+            - **macOS**: `VideomancerControl_macOS.zip` — Universal binary, native on both Apple Silicon (M1+) and Intel Macs.
             - **Windows**: `VideomancerControl_Windows.zip`
 
             Signed and notarized by Apple — no security warnings on macOS.
