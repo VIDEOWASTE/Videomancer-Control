@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.4.2"
+APP_VERSION = "2.4.3"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -83,7 +83,14 @@ class _UpdateDownloader(QThread):
     @staticmethod
     def asset_name_for_platform() -> Optional[str]:
         if sys.platform == "darwin":
-            return "VideomancerControl_macOS.zip"
+            import platform
+            # arm64 → Apple Silicon build; x86_64 → Intel build.
+            # Running an Apple-Silicon binary under Rosetta still reports
+            # "x86_64" via platform.machine(), which means Intel Macs and
+            # translated processes both correctly land on the Intel zip.
+            if platform.machine() == "arm64":
+                return "VideomancerControl_macOS.zip"
+            return "VideomancerControl_macOS_Intel.zip"
         if sys.platform.startswith("win"):
             return "VideomancerControl_Windows.zip"
         return None

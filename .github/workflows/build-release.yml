@@ -19,12 +19,11 @@ jobs:
       - name: Install dependencies
         run: pip install PyQt6 pyserial pyinstaller
 
-      - name: Build binary
+      - name: Build binary (arm64)
         run: |
           pyinstaller --onedir --windowed \
             --name "Videomancer Control" \
             --icon "icon.icns" \
-            --target-architecture universal2 \
             --hidden-import serial.tools.list_ports \
             --collect-submodules PyQt6 \
             --add-data "fonts:fonts" \
@@ -113,6 +112,111 @@ jobs:
           path: VideomancerControl_macOS.zip
 
 
+  build-macos-intel:
+    # Intel build runs on the last macOS Intel runner so PyQt6-Qt6's
+    # x86_64 wheel is picked up natively. Ships as a second zip; the
+    # in-app updater chooses between the two based on platform.machine().
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Install dependencies
+        run: pip install PyQt6 pyserial pyinstaller
+
+      - name: Build binary (x86_64)
+        run: |
+          pyinstaller --onedir --windowed \
+            --name "Videomancer Control" \
+            --icon "icon.icns" \
+            --hidden-import serial.tools.list_ports \
+            --collect-submodules PyQt6 \
+            --add-data "fonts:fonts" \
+            main.py
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k actions build.keychain
+          rm certificate.p12
+
+      - name: Sign the app
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY="Developer ID Application: Nathaniel Coleman ($APPLE_TEAM_ID)"
+          APP="dist/Videomancer Control.app"
+
+          find "$APP/Contents" \( -name "*.dylib" -o -name "*.so" \) -print0 \
+            | xargs -0 -I {} codesign --force --timestamp --options runtime \
+                --sign "$IDENTITY" {}
+
+          if [ -d "$APP/Contents/Frameworks" ]; then
+            find "$APP/Contents/Frameworks" -type d -name "*.framework" -print0 \
+              | xargs -0 -I {} codesign --force --timestamp --options runtime \
+                  --sign "$IDENTITY" {}
+          fi
+
+          find "$APP/Contents/MacOS" -type f -perm +111 -print0 \
+            | xargs -0 -I {} codesign --force --timestamp --options runtime \
+                --entitlements entitlements.plist \
+                --sign "$IDENTITY" {}
+
+          codesign --force --timestamp --options runtime \
+            --entitlements entitlements.plist \
+            --sign "$IDENTITY" \
+            "$APP"
+
+          codesign --verify --verbose=2 "$APP"
+          codesign -dv --entitlements - "$APP"
+
+      - name: Notarize and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent "dist/Videomancer Control.app" notarize.zip
+
+          xcrun notarytool submit notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+
+          xcrun stapler staple "dist/Videomancer Control.app"
+          xcrun stapler validate "dist/Videomancer Control.app"
+          spctl --assess --type execute --verbose=2 "dist/Videomancer Control.app" || true
+
+      - name: Create zip
+        run: |
+          cd dist
+          ditto -c -k --keepParent "Videomancer Control.app" ../VideomancerControl_macOS_Intel.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: macos-intel
+          path: VideomancerControl_macOS_Intel.zip
+
+
   build-windows:
     runs-on: windows-latest
     steps:
@@ -141,17 +245,22 @@ jobs:
           path: VideomancerControl_Windows.zip
 
   release:
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-macos-intel, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download macOS artifact
+      - name: Download macOS (Apple Silicon) artifact
         uses: actions/download-artifact@v5
         with:
           name: macos
+
+      - name: Download macOS (Intel) artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: macos-intel
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v5
@@ -167,20 +276,13 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
-            ### What's new in this release
-            - **In-app auto-updater** — the app detects a newer GitHub release, downloads and installs it in place, and relaunches. Manual download link lives in the System tab under Documentation → App Releases.
-            - **Move to Applications prompt** on first launch from Downloads/Desktop.
-            - **LFO waveform visualization** — each modulator type (Audio Input, Step Seq, Random, etc.) renders in a distinct style so you can read the modulation source at a glance.
-            - **TSS (Time / Space / Slope) glide** now matches the main parameter knobs — no more choppy catch-up.
-            - **rc16 firmware compatibility** — Audio Input correctly mapped to the new operator ID.
-            - **Better restore UX** — snapshot restore confirmation shows the target program, no lingering "both programs running" artifact, Save As dialog for snapshots.
-            - **Polish** — app version shown in System tab, custom dark confirmation dialogs with the Videomancer character, console noise reduced, tab title spacing locked.
-
             ### Downloads
-            - **macOS**: `VideomancerControl_macOS.zip` — Universal binary, native on both Apple Silicon (M1+) and Intel Macs.
+            - **macOS (Apple Silicon)**: `VideomancerControl_macOS.zip` — M1 / M2 / M3 / M4.
+            - **macOS (Intel)**: `VideomancerControl_macOS_Intel.zip` — Intel-based Macs.
             - **Windows**: `VideomancerControl_Windows.zip`
 
-            Signed and notarized by Apple — no security warnings on macOS.
+            Both macOS builds are signed and notarized by Apple — no security warnings.
+            The in-app updater picks the right one for your machine automatically.
 
             ### Run from source
             ```
@@ -189,6 +291,7 @@ jobs:
             ```
           files: |
             VideomancerControl_macOS.zip
+            VideomancerControl_macOS_Intel.zip
             VideomancerControl_Windows.zip
           draft: false
           prerelease: false
