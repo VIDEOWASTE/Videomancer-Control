@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.4.1"
 GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
 
 import sys
@@ -52,7 +52,7 @@ from serial_worker import SerialWorker
 class _UpdateChecker(QThread):
     """Background thread that checks GitHub releases for a newer version."""
     from PyQt6.QtCore import pyqtSignal
-    update_available = pyqtSignal(str, str)  # (new_version, download_url)
+    update_available = pyqtSignal(str, str)  # (new_version, release_html_url)
 
     def run(self):
         try:
@@ -70,6 +70,79 @@ class _UpdateChecker(QThread):
                 self.update_available.emit(remote_ver, html_url)
         except Exception:
             pass  # Network errors are non-fatal
+
+
+class _UpdateDownloader(QThread):
+    """Downloads + unzips the platform-specific release asset, strips quarantine,
+    and emits the path of the extracted .app bundle."""
+    from PyQt6.QtCore import pyqtSignal
+    progress = pyqtSignal(int, int)    # (downloaded_bytes, total_bytes)
+    finished_ok = pyqtSignal(str)      # (extracted_bundle_path)
+    failed = pyqtSignal(str)           # (message)
+
+    @staticmethod
+    def asset_name_for_platform() -> Optional[str]:
+        if sys.platform == "darwin":
+            return "VideomancerControl_macOS.zip"
+        if sys.platform.startswith("win"):
+            return "VideomancerControl_Windows.zip"
+        return None
+
+    def run(self):
+        try:
+            import tempfile, zipfile, subprocess
+            from urllib.request import urlopen, Request
+
+            asset_name = self.asset_name_for_platform()
+            if not asset_name:
+                self.failed.emit("No installer available for this platform.")
+                return
+
+            # Fetch latest release metadata, find the matching asset URL
+            api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = Request(api, headers={"Accept": "application/vnd.github+json",
+                                        "User-Agent": "VideomancerControl"})
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            assets = data.get("assets") or []
+            dl_url = next(
+                (a.get("browser_download_url") for a in assets
+                 if a.get("name") == asset_name),
+                None,
+            )
+            if not dl_url:
+                self.failed.emit(f"Release missing asset {asset_name!r}.")
+                return
+
+            tmpdir = Path(tempfile.mkdtemp(prefix="vmctl-update-"))
+            zip_path = tmpdir / asset_name
+
+            req = Request(dl_url, headers={"User-Agent": "VideomancerControl"})
+            with urlopen(req, timeout=60) as resp:
+                total = int(resp.headers.get("Content-Length") or 0)
+                downloaded = 0
+                with open(zip_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        self.progress.emit(downloaded, total)
+
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(tmpdir)
+
+            new_bundle = next(tmpdir.rglob("*.app"), None)
+            if new_bundle is None:
+                self.failed.emit("Downloaded zip contains no .app bundle.")
+                return
+
+            # Strip quarantine xattr so Gatekeeper doesn't re-prompt on launch
+            subprocess.run(["xattr", "-cr", str(new_bundle)], check=False)
+            self.finished_ok.emit(str(new_bundle))
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
     @staticmethod
     def _is_newer(remote: str, local: str) -> bool:
@@ -1452,12 +1525,17 @@ class ProgramsTab(QWidget):
 
 # ── Operator definitions ───────────────────────────────────────────────
 
+# NOTE: Firmware rc16 reshuffled operator IDs. Verified so far against rc16:
+#   31 → Audio Input (confirmed: `modulation status` shows s=31 for channel
+#        set to Audio Input via device menu, and output responds to audio).
+# The rest of this list still reflects rc15 naming and may be mislabeled on
+# rc16 until we map each ID. If a dropdown entry doesn't do what its label
+# says on rc16, the ID→name pairing here is the thing to fix.
 OPERATORS = [
     (0,  "Disabled"),
     (1,  "Free LFO"),
     (2,  "Sync LFO"),
     (3,  "CV Input"),
-    (4,  "Audio Input"),
     (5,  "Random"),
     (6,  "Envelope"),
     (7,  "Sample & Hold"),
@@ -1484,7 +1562,7 @@ OPERATORS = [
     (28, "Wavefolder"),
     (29, "Clock Div"),
     (30, "Prob Gate"),
-    (31, "Quantizer"),
+    (31, "Audio Input"),   # rc16
     (32, "Mouse"),
     (33, "Keyboard"),
     (34, "Gamepad"),
@@ -1493,6 +1571,37 @@ OPERATORS = [
     (37, "Sensor"),
     (38, "MIDI Turing"),
 ]
+
+
+# Visual style for the ModBar waveform per operator. Anything not listed here
+# falls back to the smooth curve. Keeps each modulator type readable at a glance.
+OPERATOR_WAVEFORM_STYLES = {
+    # Audio-ish — symmetric-around-center fill
+    31: "audio",   # Audio Input (rc16 ID)
+    4:  "audio",   # Audio Input (rc15 legacy — harmless if unused)
+    10: "audio",   # FFT Band
+    21: "audio",   # Ring Mod
+    # Stepped / gated — rectangular steps
+    7:  "stepped", # Sample & Hold
+    8:  "stepped", # Trigger Env
+    9:  "stepped", # Step Seq
+    15: "stepped", # Euclidean Rhythm
+    18: "stepped", # Comparator
+    23: "stepped", # Pulse Width
+    24: "stepped", # Peak Hold
+    29: "stepped", # Clock Div
+    30: "stepped", # Prob Gate
+    # Random / noisy — sharp straight lines, no smoothing
+    5:  "jagged",  # Random
+    12: "jagged",  # Turing Machine
+    22: "jagged",  # Cellular
+    27: "jagged",  # Perlin Noise
+    38: "jagged",  # MIDI Turing
+}
+
+
+def _waveform_style_for(op_id: int) -> str:
+    return OPERATOR_WAVEFORM_STYLES.get(op_id, "smooth")
 
 # Operator index → (time_label, space_label, slope_label)
 OP_LABELS = {
@@ -1571,6 +1680,11 @@ class KnobWidget(QWidget):
         self._drag_v = 0.0
         self._frac   = 0.0
         self._user_dragging = False
+        # Time-based LERP: glide from current display to target over poll interval
+        self._lerp_start_frac = 0.0
+        self._lerp_target_frac = 0.0
+        self._lerp_start_time = 0.0
+        self._lerp_duration = 0.36   # ~1 poll interval → continuous hand-off
         self.setFixedSize(size, size)
         self.setCursor(Qt.CursorShape.SizeVerCursor)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -1595,8 +1709,14 @@ class KnobWidget(QWidget):
         self._frac = new_frac
         if not animate:
             self._display_frac = new_frac
-        # When animate=True, _frac is set but _display_frac is NOT —
-        # _smooth_step will glide _display_frac toward _frac.
+            self._lerp_start_frac = new_frac
+            self._lerp_target_frac = new_frac
+        else:
+            # Time-based LERP from current display to new target.
+            # Each new poll hands off smoothly mid-animation.
+            self._lerp_start_frac = self._display_frac
+            self._lerp_target_frac = new_frac
+            self._lerp_start_time = time.monotonic()
         if not self._smooth_timer.isActive():
             self._smooth_timer.start()
         self.update()
@@ -1607,23 +1727,23 @@ class KnobWidget(QWidget):
             self._smooth_timer.start()
 
     def _smooth_step(self):
-        """Timer-driven glide — only runs when animating.
-        Glide factor calibrated so motion spreads across the ~350ms poll
-        interval (≈21 frames @ 60fps) instead of snapping in 3 frames and
-        stalling. Prevents the step/jump look when device values change."""
+        """Constant-velocity LERP from last display position to new target.
+        Each poll-driven setValue() starts a new LERP — motion is continuous
+        across poll boundaries instead of exp-decay catch-up-then-stall."""
         if self._user_dragging:
             self._smooth_timer.stop()
             return
-        diff = self._frac - self._display_frac
-        glide = 0.18
-        if abs(diff) > 0.0005:
-            self._display_frac += diff * glide
-            self.update()
-        else:
-            self._display_frac = self._frac
+        elapsed = time.monotonic() - self._lerp_start_time
+        t = elapsed / self._lerp_duration if self._lerp_duration > 0 else 1.0
+        if t >= 1.0:
+            self._display_frac = self._lerp_target_frac
             self._tss_glide = False
             self.update()
-            self._smooth_timer.stop()  # settled — stop until needed
+            self._smooth_timer.stop()
+            return
+        self._display_frac = self._lerp_start_frac + \
+            (self._lerp_target_frac - self._lerp_start_frac) * t
+        self.update()
 
     def setRange(self, mn, mx):
         self._min, self._max = mn, mx
@@ -1745,6 +1865,11 @@ class SmoothFader(QWidget):
         self._timer = QTimer()
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._step)
+        # Time-based LERP state
+        self._lerp_start = 0.0
+        self._lerp_target = 0.0
+        self._lerp_start_time = 0.0
+        self._lerp_duration = 0.36
 
     def setRange(self, mn, mx):
         self._min, self._max = mn, mx
@@ -1756,7 +1881,12 @@ class SmoothFader(QWidget):
         self._value = v
         if not animate or self._dragging:
             self._display_val = float(v)
+            self._lerp_start = self._display_val
+            self._lerp_target = self._display_val
         else:
+            self._lerp_start = self._display_val
+            self._lerp_target = float(v)
+            self._lerp_start_time = time.monotonic()
             if not self._timer.isActive():
                 self._timer.start()
         self.valueChanged.emit(v)
@@ -1769,19 +1899,17 @@ class SmoothFader(QWidget):
         if self._dragging:
             self._timer.stop()
             return
-        target = float(self._value)
-        diff = target - self._display_val
-        # Glide spread across the ~350ms poll interval (≈21 frames @ 60fps)
-        # so fader motion is continuous instead of snap-and-stall.
-        if abs(diff) > 0.5:
-            self._display_val += diff * 0.18
-            self._velocity = 0.0
-            self.update()
-        else:
-            self._display_val = target
+        elapsed = time.monotonic() - self._lerp_start_time
+        t = elapsed / self._lerp_duration if self._lerp_duration > 0 else 1.0
+        if t >= 1.0:
+            self._display_val = self._lerp_target
             self._velocity = 0.0
             self.update()
             self._timer.stop()
+            return
+        self._display_val = self._lerp_start + (self._lerp_target - self._lerp_start) * t
+        self._velocity = 0.0
+        self.update()
 
     def _frac(self):
         return (self._display_val - self._min) / max(1, self._max - self._min)
@@ -1903,6 +2031,11 @@ class HorizontalFader(QWidget):
         self._timer = QTimer()
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._step)
+        # Time-based LERP state
+        self._lerp_start = 0.0
+        self._lerp_target = 0.0
+        self._lerp_start_time = 0.0
+        self._lerp_duration = 0.36
 
     def setRange(self, mn, mx):
         self._min, self._max = mn, mx
@@ -1914,7 +2047,12 @@ class HorizontalFader(QWidget):
         self._value = v
         if not animate or self._dragging:
             self._display_val = float(v)
+            self._lerp_start = self._display_val
+            self._lerp_target = self._display_val
         else:
+            self._lerp_start = self._display_val
+            self._lerp_target = float(v)
+            self._lerp_start_time = time.monotonic()
             if not self._timer.isActive():
                 self._timer.start()
         self.valueChanged.emit(v)
@@ -1927,18 +2065,17 @@ class HorizontalFader(QWidget):
         if self._dragging:
             self._timer.stop()
             return
-        target = float(self._value)
-        diff = target - self._display_val
-        # Glide calibrated to poll interval — matches SmoothFader/KnobWidget.
-        if abs(diff) > 0.5:
-            self._display_val += diff * 0.18
-            self._velocity = 0.0
-            self.update()
-        else:
-            self._display_val = target
+        elapsed = time.monotonic() - self._lerp_start_time
+        t = elapsed / self._lerp_duration if self._lerp_duration > 0 else 1.0
+        if t >= 1.0:
+            self._display_val = self._lerp_target
             self._velocity = 0.0
             self.update()
             self._timer.stop()
+            return
+        self._display_val = self._lerp_start + (self._lerp_target - self._lerp_start) * t
+        self._velocity = 0.0
+        self.update()
 
     def _frac(self):
         return (self._display_val - self._min) / max(1, self._max - self._min)
@@ -2184,7 +2321,15 @@ class SparkleRing(QWidget):
 
 
 class ModBar(QWidget):
-    """Rolling waveform showing live LFO output with smooth interpolation."""
+    """Rolling waveform showing live LFO output with smooth interpolation.
+    The visual style can be switched per operator type so audio/stepped/jagged
+    modulators read distinctly at a glance."""
+
+    # Render styles
+    STYLE_SMOOTH  = "smooth"   # default — cubic bezier curve, bottom-referenced
+    STYLE_AUDIO   = "audio"    # symmetric around center, denser fill (audio)
+    STYLE_STEPPED = "stepped"  # rectangular steps (sequencer/gate-like)
+    STYLE_JAGGED  = "jagged"   # straight sharp lines, no smoothing (random/noise)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2194,6 +2339,7 @@ class ModBar(QWidget):
         self._history_len = 600  # longer time window — slower scroll
         self._display_val = 0.0  # smoothed current value
         self._target_val = 0.0
+        self._style = self.STYLE_SMOOTH
         self.setFixedHeight(40)
         self.setMinimumWidth(10)
 
@@ -2201,6 +2347,11 @@ class ModBar(QWidget):
         self._render_timer = QTimer()
         self._render_timer.setInterval(16)
         self._render_timer.timeout.connect(self._interpolate)
+
+    def setStyle(self, style: str):
+        if style != self._style:
+            self._style = style
+            self.update()
 
     def setValue(self, v: int):
         v = max(0, min(self._max, v))
@@ -2213,15 +2364,22 @@ class ModBar(QWidget):
             self._render_timer.stop()
             return
         diff = self._target_val - self._display_val
+        # Audio wants punchy response (see the signal move); other styles
+        # look cleaner with more smoothing (LFOs, sequencers, etc.)
+        factor = 0.40 if self._style == self.STYLE_AUDIO else 0.10
         if abs(diff) > 0.1:
-            self._display_val += diff * 0.1
+            self._display_val += diff * factor
         elif abs(diff) > 0.01:
             self._display_val = self._target_val
-        # Record interpolated value every frame for smooth waveform
         self._history.append(self._display_val)
-        if len(self._history) > self._history_len:
-            self._history = self._history[-self._history_len:]
+        if len(self._history) > self._effective_history_len():
+            self._history = self._history[-self._effective_history_len():]
         self.update()
+
+    def _effective_history_len(self) -> int:
+        # Scroll speed stays the same across all styles; detail comes from the
+        # per-style interpolation factor above, not a shorter window.
+        return self._history_len
 
     def setActive(self, active: bool):
         self._active = active
@@ -2250,18 +2408,106 @@ class ModBar(QWidget):
             p.end()
             return
 
-        # Build smooth point list
+        from PyQt6.QtCore import QPointF
         n = len(self._history)
-        step_x = w / max(1, self._history_len - 1)
+        hist_len = self._effective_history_len()
+        step_x = w / max(1, hist_len - 1)
         start_x = w - (n - 1) * step_x
+
+        fill_color = QColor("#7c3aed")
+        fill_color.setAlpha(60)
+        line_color = QColor("#c040c0")
+
+        if self._style == self.STYLE_AUDIO:
+            # Symmetric around vertical center — looks like an audio waveform.
+            # Excursion scales with distance from the mid-point of the range.
+            center_y = h * 0.5
+            max_excursion = h * 0.5 - 2
+            top_pts, bot_pts = [], []
+            for i, val in enumerate(self._history):
+                x = start_x + i * step_x
+                # Value 0 → no excursion; value at max → full top/bottom
+                frac = (val - self._max * 0.5) / (self._max * 0.5)
+                dy = max_excursion * frac
+                top_pts.append((x, center_y - abs(dy)))
+                bot_pts.append((x, center_y + abs(dy)))
+            # Fill between top and bottom envelope
+            fill = QPainterPath()
+            fill.moveTo(QPointF(top_pts[0][0], top_pts[0][1]))
+            for x, y in top_pts[1:]:
+                fill.lineTo(QPointF(x, y))
+            for x, y in reversed(bot_pts):
+                fill.lineTo(QPointF(x, y))
+            fill.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill_color)
+            p.drawPath(fill)
+            # Center reference line
+            p.setPen(QPen(line_color, 1.2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            top_path = QPainterPath()
+            bot_path = QPainterPath()
+            top_path.moveTo(QPointF(*top_pts[0]))
+            bot_path.moveTo(QPointF(*bot_pts[0]))
+            for x, y in top_pts[1:]:
+                top_path.lineTo(QPointF(x, y))
+            for x, y in bot_pts[1:]:
+                bot_path.lineTo(QPointF(x, y))
+            p.drawPath(top_path)
+            p.drawPath(bot_path)
+            p.end()
+            return
+
+        # Common point list (bottom-referenced)
         points = []
         for i, val in enumerate(self._history):
             x = start_x + i * step_x
             y = h - (val / self._max) * (h - 2)
             points.append((x, y))
 
-        # Build cubic bezier curve through points
-        from PyQt6.QtCore import QPointF
+        if self._style == self.STYLE_STEPPED:
+            # Flat segments with vertical transitions — sequencer / gate look
+            path = QPainterPath()
+            path.moveTo(QPointF(points[0][0], points[0][1]))
+            for i in range(1, len(points)):
+                x0, y0 = points[i - 1]
+                x1, y1 = points[i]
+                path.lineTo(QPointF(x1, y0))  # hold
+                path.lineTo(QPointF(x1, y1))  # step
+            fill_path = QPainterPath(path)
+            fill_path.lineTo(QPointF(points[-1][0], h))
+            fill_path.lineTo(QPointF(points[0][0], h))
+            fill_path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill_color)
+            p.drawPath(fill_path)
+            p.setPen(QPen(line_color, 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+            p.end()
+            return
+
+        if self._style == self.STYLE_JAGGED:
+            # Straight sharp lines, no smoothing — emphasizes abrupt changes
+            path = QPainterPath()
+            path.moveTo(QPointF(points[0][0], points[0][1]))
+            for x, y in points[1:]:
+                path.lineTo(QPointF(x, y))
+            fill_path = QPainterPath(path)
+            fill_path.lineTo(QPointF(points[-1][0], h))
+            fill_path.lineTo(QPointF(points[0][0], h))
+            fill_path.closeSubpath()
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(fill_color)
+            p.drawPath(fill_path)
+            p.setPen(QPen(line_color, 1.5, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.SquareCap, Qt.PenJoinStyle.MiterJoin))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+            p.end()
+            return
+
+        # STYLE_SMOOTH (default) — cubic bezier through samples
         def _smooth_path(pts):
             path = QPainterPath()
             path.moveTo(QPointF(pts[0][0], pts[0][1]))
@@ -2271,7 +2517,6 @@ class ModBar(QWidget):
             for i in range(1, len(pts)):
                 x0, y0 = pts[i - 1]
                 x1, y1 = pts[i]
-                # Control points at 1/3 intervals for smooth cubic
                 tension = step_x * 0.4
                 path.cubicTo(
                     QPointF(x0 + tension, y0),
@@ -2281,21 +2526,16 @@ class ModBar(QWidget):
             return path
 
         curve = _smooth_path(points)
-
-        # Filled area under curve
         fill_path = QPainterPath(curve)
         fill_path.lineTo(QPointF(points[-1][0], h))
         fill_path.lineTo(QPointF(points[0][0], h))
         fill_path.closeSubpath()
 
-        fill_color = QColor("#7c3aed")
-        fill_color.setAlpha(60)
         p.setBrush(fill_color)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawPath(fill_path)
 
-        # Waveform line
-        p.setPen(QPen(QColor("#c040c0"), 1.5, Qt.PenStyle.SolidLine,
+        p.setPen(QPen(line_color, 1.5, Qt.PenStyle.SolidLine,
                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(curve)
@@ -2676,6 +2916,8 @@ class ChannelCard(QWidget):
         self._op_lbl.setText(op_name)
         self._update_tss_labels(op_id)
         self._update_tss_enabled(op_id)
+        if hasattr(self, "_out_bar"):
+            self._out_bar.setStyle(_waveform_style_for(op_id))
         self.op_combo.blockSignals(True)
         self.op_combo.setCurrentIndex(self._op_index)
         self.op_combo.blockSignals(False)
@@ -2689,6 +2931,8 @@ class ChannelCard(QWidget):
         self._op_lbl.setText(OPERATORS[idx][1])
         self._update_tss_labels(op_id)
         self._update_tss_enabled(op_id)
+        if hasattr(self, "_out_bar"):
+            self._out_bar.setStyle(_waveform_style_for(op_id))
         self.op_combo.blockSignals(True)
         self.op_combo.setCurrentIndex(idx)
         self.op_combo.blockSignals(False)
@@ -2698,18 +2942,15 @@ class ChannelCard(QWidget):
         if not self._tss_sliders:
             return
         self._updating = silent
-        for knob, val in zip(self._tss_sliders, (t, sp, sl)):
-            if knob._user_dragging:
-                continue
-            val = max(knob._min, min(knob._max, int(val)))
-            if val == knob._value:
-                continue
-            knob._value = val
-            knob._frac = (val - knob._min) / max(1, knob._max - knob._min)
-            # Use slower glide for TSS — spread over full poll interval
-            if not knob._smooth_timer.isActive():
-                knob._smooth_timer.start()
-        self._updating = False
+        try:
+            for knob, val in zip(self._tss_sliders, (t, sp, sl)):
+                if knob._user_dragging:
+                    continue
+                # Route through setValue so the time-based LERP is set up
+                # correctly; `_updating` guards against the re-entry loop.
+                knob.setValue(int(val), animate=True)
+        finally:
+            self._updating = False
 
     def _on_tss(self, field: str, value: int):
         if self._updating:
@@ -4203,7 +4444,7 @@ class SystemTab(QWidget):
         self._fw_fields = {}
         for label, key in [
             ("Version",     "version"),
-            ("Device",      "device"),
+            ("App",         "app"),
             ("Uptime",      "uptime"),
         ]:
             row = QHBoxLayout()
@@ -4215,6 +4456,8 @@ class SystemTab(QWidget):
             row.addWidget(val, stretch=1)
             fl.addLayout(row)
             self._fw_fields[key] = val
+        # App row is static — show the running version always
+        self._fw_fields["app"].setText(f"v{APP_VERSION}")
 
         rl.addWidget(fw_grp)
 
@@ -4278,8 +4521,9 @@ class SystemTab(QWidget):
 
         self._doc_links = [
             ("Community", "https://community.lzxindustries.net/"),
-            ("Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
+            ("Device Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
             ("Technical Manual", "https://docs.lzxindustries.net/docs/instruments/videomancer"),
+            ("App Releases", f"https://github.com/{GITHUB_REPO}/releases"),
         ]
         for label, url in self._doc_links:
             btn = QPushButton(f"📖  {label}")
@@ -4320,7 +4564,10 @@ class SystemTab(QWidget):
         self._conn_comp_btn.setEnabled(v)
         self.timing_combo.setEnabled(v)
         if not v:
-            for val in self._fw_fields.values():
+            for key, val in self._fw_fields.items():
+                # "app" is static — always show the running app version
+                if key == "app":
+                    continue
                 val.setText("\u2014")
             for val in self._status_fields.values():
                 val.setText("\u2014")
@@ -4417,11 +4664,9 @@ class SystemTab(QWidget):
         if self.on_send:
             self.on_send(f"video input {src}")
 
-    def apply_firmware_info(self, version: str, device: str = "",
-                            uptime: str = ""):
-        """Populate the firmware info fields."""
+    def apply_firmware_info(self, version: str, uptime: str = ""):
+        """Populate the firmware info fields. App row is static (set at init)."""
         self._fw_fields["version"].setText(version or "\u2014")
-        self._fw_fields["device"].setText(device or "Videomancer")
         self._fw_fields["uptime"].setText(uptime or "\u2014")
 
     def _refresh(self):
@@ -5044,12 +5289,6 @@ class VideomancerApp(QMainWindow):
         self._copy_btn = copy_btn
         copy_btn.clicked.connect(lambda: self.console._copy_all())
         console_header.addWidget(copy_btn)
-        clr_btn = QPushButton("CLEAR")
-        clr_btn.setFixedHeight(22)
-        clr_btn.setFixedWidth(54)
-        clr_btn.setStyleSheet(f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};border-radius:3px;color:{TEXT_DIM};font-size:10px;padding:0;}}QPushButton:hover{{color:{TEXT};}}")
-        clr_btn.clicked.connect(lambda: self.console.text.clear())
-        console_header.addWidget(clr_btn)
         self._console_toggle_btn = QPushButton("▶  SHOW")
         self._console_toggle_btn.setFixedHeight(22)
         self._console_toggle_btn.setFixedWidth(80)
@@ -5214,14 +5453,145 @@ class VideomancerApp(QMainWindow):
 
     def _on_update_available(self, version: str, url: str):
         self._update_url = url
-        self._update_btn.setText(f"v{version} available — click to download")
+        self._update_version = version
+        self._update_btn.setText(f"v{version} available — click to install")
         self._update_btn.setVisible(True)
 
     def _open_update_url(self):
-        if self._update_url:
-            from PyQt6.QtGui import QDesktopServices
-            from PyQt6.QtCore import QUrl
-            QDesktopServices.openUrl(QUrl(self._update_url))
+        """Entry point when the header update button is clicked."""
+        if not self._update_url:
+            return
+        self._start_update_flow()
+
+    def _start_update_flow(self):
+        """Confirm → download-with-progress → restart prompt → install."""
+        version = getattr(self, "_update_version", "")
+        if not _VMConfirmDialog.ask(
+            self,
+            "Update Available",
+            f"Version <b>{version}</b> is available.<br><br>"
+            f"Download and install it now? The app will restart when the "
+            f"update is ready.",
+        ):
+            return
+
+        # Refuse if we can't locate our own .app (running from source etc.)
+        exe = Path(sys.executable).resolve()
+        current_bundle = next(
+            (p for p in exe.parents if p.suffix == ".app"), None,
+        )
+        if current_bundle is None:
+            _VMConfirmDialog.notify(
+                self, "Running from Source",
+                "Auto-install only works when launched from a built .app "
+                "bundle. Use the Releases link in the System tab's "
+                "Documentation section to download manually.",
+            )
+            return
+
+        from PyQt6.QtWidgets import QProgressDialog
+        self._update_progress = QProgressDialog(
+            f"Downloading v{version}…", "Cancel", 0, 100, self,
+        )
+        self._update_progress.setWindowTitle("Updating")
+        self._update_progress.setMinimumDuration(0)
+        self._update_progress.setAutoClose(False)
+        self._update_progress.setAutoReset(False)
+
+        self._update_downloader = _UpdateDownloader()
+        self._update_current_bundle = current_bundle
+
+        def _on_progress(done, total):
+            if total > 0:
+                self._update_progress.setMaximum(total)
+                self._update_progress.setValue(done)
+            else:
+                # Unknown total — indeterminate bar
+                self._update_progress.setMaximum(0)
+
+        def _on_done(path):
+            self._update_progress.close()
+            self._prompt_restart_and_install(Path(path))
+
+        def _on_failed(msg):
+            self._update_progress.close()
+            _VMConfirmDialog.notify(
+                self, "Update Failed",
+                f"Could not complete the update.\n\n{msg}\n\n"
+                f"You can download manually from the Releases link in the "
+                f"System tab.",
+            )
+
+        self._update_downloader.progress.connect(_on_progress)
+        self._update_downloader.finished_ok.connect(_on_done)
+        self._update_downloader.failed.connect(_on_failed)
+        self._update_progress.canceled.connect(self._update_downloader.terminate)
+        self._update_downloader.start()
+
+    def _prompt_restart_and_install(self, new_bundle: Path):
+        if not _VMConfirmDialog.ask(
+            self,
+            "Update Ready",
+            f"Download complete. Restart Videomancer Control now to install "
+            f"<b>v{getattr(self, '_update_version', '')}</b>?",
+        ):
+            return
+        try:
+            self._perform_install_and_restart(new_bundle)
+        except Exception as exc:
+            _VMConfirmDialog.notify(
+                self, "Install Failed",
+                f"The install step didn't complete.\n\n{exc}",
+            )
+
+    def _perform_install_and_restart(self, new_bundle: Path):
+        """Write a small helper script that waits for this process to exit,
+        swaps the bundle, and relaunches. Then quit.
+
+        The new bundle is placed in the OLD bundle's parent directory but
+        keeps its OWN filename — so upgrades from a legacy bundle name (e.g.
+        `VideomancerControl.app` → `Videomancer Control.app`) install with the
+        new name rather than being renamed back to the old one.
+        """
+        import tempfile, os, subprocess, stat
+        old_bundle = self._update_current_bundle
+        # Install the new bundle alongside the old one, preserving the new name
+        install_path = old_bundle.parent / new_bundle.name
+        pid = os.getpid()
+        script = f"""#!/bin/bash
+set -e
+PARENT_PID={pid}
+OLD_APP={str(old_bundle)!r}
+NEW_APP={str(new_bundle)!r}
+INSTALL_PATH={str(install_path)!r}
+# Wait for parent to exit (cap at 30 s)
+for i in $(seq 1 60); do
+    if ! kill -0 "$PARENT_PID" 2>/dev/null; then break; fi
+    sleep 0.5
+done
+sleep 0.5
+# Move old aside to Trash (keeps a recovery copy)
+if [ -d "$OLD_APP" ]; then
+    TS=$(date +%s)
+    /bin/mv "$OLD_APP" "$HOME/.Trash/$(basename "$OLD_APP").$TS.bak" 2>/dev/null || /bin/rm -rf "$OLD_APP"
+fi
+# If something exists at the install path (e.g. same-name bundle), trash it too
+if [ -d "$INSTALL_PATH" ] && [ "$INSTALL_PATH" != "$OLD_APP" ]; then
+    TS=$(date +%s)
+    /bin/mv "$INSTALL_PATH" "$HOME/.Trash/$(basename "$INSTALL_PATH").$TS.bak" 2>/dev/null || /bin/rm -rf "$INSTALL_PATH"
+fi
+/bin/mv "$NEW_APP" "$INSTALL_PATH"
+/usr/bin/xattr -cr "$INSTALL_PATH" 2>/dev/null || true
+/usr/bin/open "$INSTALL_PATH"
+"""
+        tmpdir = Path(tempfile.mkdtemp(prefix="vmctl-install-"))
+        script_path = tmpdir / "install.sh"
+        script_path.write_text(script)
+        script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC |
+                          stat.S_IXGRP | stat.S_IXOTH)
+        subprocess.Popen([str(script_path)], start_new_session=True)
+        # Quit so the helper can replace our bundle
+        QApplication.quit()
 
     # ------------------------------------------------------------------
     # Connection
@@ -5635,8 +6005,6 @@ class VideomancerApp(QMainWindow):
         # If firmware reports uptime, use it instead of local timer
         if "uptime" in data:
             self.system_tab._fw_fields["uptime"].setText(str(data["uptime"]))
-        if "device" in data:
-            self.system_tab._fw_fields["device"].setText(str(data["device"]))
 
     # ------------------------------------------------------------------
     # Programs
@@ -5744,7 +6112,10 @@ class VideomancerApp(QMainWindow):
             self._poll_count += 1
             if self._poll_count % 4 == 0:
                 self._worker.send("transport status")
-            if self._poll_count % 3 == 0 and not self._user_editing:
+            if not self._user_editing:
+                # Poll every tick so TSS knobs (carried in `program state`)
+                # update at the same cadence as the main knobs in
+                # `modulation status` — keeps their glide visually matched.
                 self._worker.send("program state")
             if self._poll_count % 20 == 0:
                 self._worker.send("video status")
@@ -6076,13 +6447,64 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
     import traceback
     traceback.print_exception(exc_type, exc_value, exc_tb)
 
+def _offer_move_to_applications():
+    """If launched from Downloads or Desktop, offer to move the .app bundle
+    into /Applications so menu/dock/Spotlight behave the way users expect.
+    Silently skipped when already installed, not running as a bundle, or on
+    non-macOS platforms."""
+    if sys.platform != "darwin":
+        return
+    exe = Path(sys.executable).resolve()
+    bundle = next((p for p in exe.parents if p.suffix == ".app"), None)
+    if bundle is None:
+        return  # running from source, not a .app bundle
+    parent = str(bundle.parent.resolve())
+    home = str(Path.home().resolve())
+    # Only nag if the bundle is in a transient-looking spot
+    if parent not in (f"{home}/Downloads", f"{home}/Desktop"):
+        return
+    target = Path("/Applications") / bundle.name
+    if target.exists():
+        return  # don't clobber an existing install
+    if not _VMConfirmDialog.ask(
+        None,
+        "Move to Applications?",
+        f"Keep <b>{bundle.name}</b> in your Applications folder for easy "
+        f"launch and automatic updates? A copy will be made — you can trash "
+        f"the one in {bundle.parent.name} afterward.",
+    ):
+        return
+    try:
+        import shutil, subprocess
+        shutil.copytree(str(bundle), str(target), symlinks=True)
+        # Strip Gatekeeper quarantine so it opens cleanly next launch
+        subprocess.run(["xattr", "-cr", str(target)], check=False)
+        # Launch the copy and quit this instance
+        subprocess.Popen(["open", str(target)])
+        sys.exit(0)
+    except Exception as exc:
+        _VMConfirmDialog.notify(
+            None, "Move Failed",
+            f"Could not move the app automatically.\n\n{exc}\n\n"
+            f"You can drag it from {bundle.parent.name} to Applications "
+            f"manually.",
+        )
+
+
 def main():
     # Install global exception hook BEFORE creating QApplication
     sys.excepthook = _global_exception_hook
 
     app = QApplication(sys.argv)
     app.setApplicationName("Videomancer Control")
+    # Display name drives the Dock title, menu bar, and Cmd-Tab label even
+    # when the bundle on disk is `VideomancerControl.app` (no space).
+    app.setApplicationDisplayName("Videomancer Control")
     app.setOrganizationName("LZX Industries")
+
+    # Offer to move into /Applications if running from Downloads/Desktop.
+    # Must run after QApplication is created (we use a Qt dialog).
+    _offer_move_to_applications()
 
     # Load custom fonts (works both from source and PyInstaller bundle)
     from PyQt6.QtGui import QFontDatabase

@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 jobs:
-  build-macos-arm:
+  build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -22,7 +22,7 @@ jobs:
       - name: Build binary
         run: |
           pyinstaller --onedir --windowed \
-            --name "VideomancerControl" \
+            --name "Videomancer Control" \
             --icon "icon.icns" \
             --hidden-import serial.tools.list_ports \
             --collect-submodules PyQt6 \
@@ -51,7 +51,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           IDENTITY="Developer ID Application: Nathaniel Coleman ($APPLE_TEAM_ID)"
-          APP="dist/VideomancerControl.app"
+          APP="dist/Videomancer Control.app"
 
           # Sign all nested Mach-O binaries first (inside-out), then the bundle.
           # --deep is deprecated; we walk the tree ourselves.
@@ -87,7 +87,7 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          ditto -c -k --keepParent dist/VideomancerControl.app notarize.zip
+          ditto -c -k --keepParent "dist/Videomancer Control.app" notarize.zip
 
           xcrun notarytool submit notarize.zip \
             --apple-id "$APPLE_ID" \
@@ -96,20 +96,20 @@ jobs:
             --wait \
             --timeout 30m
 
-          xcrun stapler staple dist/VideomancerControl.app
-          xcrun stapler validate dist/VideomancerControl.app
-          spctl --assess --type execute --verbose=2 dist/VideomancerControl.app || true
+          xcrun stapler staple "dist/Videomancer Control.app"
+          xcrun stapler validate "dist/Videomancer Control.app"
+          spctl --assess --type execute --verbose=2 "dist/Videomancer Control.app" || true
 
       - name: Create zip
         run: |
           cd dist
-          ditto -c -k --keepParent "VideomancerControl.app" ../VideomancerControl_macOS_ARM.zip
+          ditto -c -k --keepParent "Videomancer Control.app" ../VideomancerControl_macOS.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: macos-arm
-          path: VideomancerControl_macOS_ARM.zip
+          name: macos
+          path: VideomancerControl_macOS.zip
 
 
   build-windows:
@@ -127,11 +127,11 @@ jobs:
 
       - name: Build .exe
         run: |
-          pyinstaller --onefile --windowed --name "VideomancerControl" --icon "icon.ico" --hidden-import serial.tools.list_ports --add-data "fonts;fonts" main.py
+          pyinstaller --onefile --windowed --name "Videomancer Control" --icon "icon.ico" --hidden-import serial.tools.list_ports --add-data "fonts;fonts" main.py
 
       - name: Create zip
         run: |
-          Compress-Archive -Path "dist\VideomancerControl.exe" -DestinationPath VideomancerControl_Windows.zip
+          Compress-Archive -Path "dist\Videomancer Control.exe" -DestinationPath VideomancerControl_Windows.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -140,7 +140,7 @@ jobs:
           path: VideomancerControl_Windows.zip
 
   release:
-    needs: [build-macos-arm, build-windows]
+    needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -150,7 +150,7 @@ jobs:
       - name: Download macOS artifact
         uses: actions/download-artifact@v5
         with:
-          name: macos-arm
+          name: macos
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v5
@@ -166,8 +166,17 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
+            ### What's new in this release
+            - **In-app auto-updater** — the app detects a newer GitHub release, downloads and installs it in place, and relaunches. Manual download link lives in the System tab under Documentation → App Releases.
+            - **Move to Applications prompt** on first launch from Downloads/Desktop.
+            - **LFO waveform visualization** — each modulator type (Audio Input, Step Seq, Random, etc.) renders in a distinct style so you can read the modulation source at a glance.
+            - **TSS (Time / Space / Slope) glide** now matches the main parameter knobs — no more choppy catch-up.
+            - **rc16 firmware compatibility** — Audio Input correctly mapped to the new operator ID.
+            - **Better restore UX** — snapshot restore confirmation shows the target program, no lingering "both programs running" artifact, Save As dialog for snapshots.
+            - **Polish** — app version shown in System tab, custom dark confirmation dialogs with the Videomancer character, console noise reduced, tab title spacing locked.
+
             ### Downloads
-            - **macOS**: `VideomancerControl_macOS_ARM.zip` — Apple Silicon (M1/M2/M3/M4). Intel Macs can run via Rosetta.
+            - **macOS**: `VideomancerControl_macOS.zip` — Apple Silicon native (M1/M2/M3/M4). Intel Macs can run via Rosetta.
             - **Windows**: `VideomancerControl_Windows.zip`
 
             Signed and notarized by Apple — no security warnings on macOS.
@@ -178,7 +187,7 @@ jobs:
             python main.py
             ```
           files: |
-            VideomancerControl_macOS_ARM.zip
+            VideomancerControl_macOS.zip
             VideomancerControl_Windows.zip
           draft: false
           prerelease: false

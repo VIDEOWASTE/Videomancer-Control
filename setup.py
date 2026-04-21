@@ -22,8 +22,8 @@ OPTIONS = {
         'CFBundleName':             'Videomancer Control',
         'CFBundleDisplayName':      'Videomancer Control',
         'CFBundleIdentifier':       'net.lzxindustries.videomancer-control',
-        'CFBundleVersion':          '2.4',
-        'CFBundleShortVersionString': '2.4',
+        'CFBundleVersion':          '2.4.1',
+        'CFBundleShortVersionString': '2.4.1',
         'NSHumanReadableCopyright': '© 2026 LZX Industries / Videowaste',
         'NSHighResolutionCapable':  True,
 
