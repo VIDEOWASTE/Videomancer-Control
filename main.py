@@ -4516,57 +4516,44 @@ class SystemTab(QWidget):
         self.on_send = None   # (cmd_str) callback
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(10)
 
-        # ── Top bar ──
-        top = QHBoxLayout()
-        title = QLabel("SYSTEM")
-        title.setFixedHeight(32)
-        title.setStyleSheet(
-            f"color:#ffffff;font-family:'Goldplay',sans-serif;"
-            f"font-size:22px;font-weight:bold;"
-            f"letter-spacing:3px;{self._TRANSPARENT}"
-        )
-        top.addWidget(title)
-        top.addStretch()
-        self.refresh_btn = QPushButton("↻  Refresh All")
-        self.refresh_btn.setFixedHeight(32)
-        self.refresh_btn.setEnabled(False)
-        self.refresh_btn.clicked.connect(self._refresh)
-        top.addWidget(self.refresh_btn)
-        root.addLayout(top)
-        root.addWidget(hsep())
+        LBL = f"color:{TEXT_DIM};font-size:14px;{self._TRANSPARENT}"
+        VAL = f"color:{TEXT};font-size:15px;font-weight:bold;{self._TRANSPARENT}"
 
-        # Scroll area so content doesn't get clipped on smaller windows
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_inner = QWidget()
-        scroll_lay = QVBoxLayout(scroll_inner)
-        scroll_lay.setContentsMargins(0, 0, 0, 0)
-        scroll_lay.setSpacing(12)
+        def field_rows(layout, rows, store, min_w=78):
+            """Label/value rows in a tight 2-column grid; values elide rather
+            than push the column wider."""
+            g = QGridLayout()
+            g.setHorizontalSpacing(10)
+            g.setVerticalSpacing(4)
+            g.setColumnStretch(1, 1)
+            for r, (label, key) in enumerate(rows):
+                lbl = QLabel(label)
+                lbl.setStyleSheet(LBL)
+                lbl.setMinimumWidth(min_w)
+                val = QLabel("\u2014")
+                val.setStyleSheet(VAL)
+                val.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                g.addWidget(lbl, r, 0)
+                g.addWidget(val, r, 1)
+                store[key] = val
+            layout.addLayout(g)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(0)
+        # Two equal columns; every section visible at the default window size
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
-        # ── Left column: Video + Status ──
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(0, 0, 8, 0)
-        ll.setSpacing(10)
-
-        # ·· Video Input & Timing ··
-        vid_grp = QGroupBox("VIDEO INPUT")
+        # ·· VIDEO: input select, live status, timing ··
+        vid_grp = QGroupBox("VIDEO")
         vl = QVBoxLayout(vid_grp)
-        vl.setSpacing(10)
+        vl.setSpacing(8)
 
-        # Source: HDMI / Analog toggle buttons
         src_row = QHBoxLayout()
-        src_lbl = QLabel("Source")
-        src_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
-        src_row.addWidget(src_lbl)
         self._src_hdmi_btn = QPushButton("HDMI")
         self._src_hdmi_btn.setCheckable(True)
         self._src_hdmi_btn.setChecked(True)
@@ -4583,26 +4570,28 @@ class SystemTab(QWidget):
         self.src_combo.setVisible(False)
         vl.addLayout(src_row)
 
-        # Input signal status. The firmware has no connector-select command
-        # (CVBS vs component), so this row only reports what `video status`
-        # says about the active input.
+        self._status_fields = {}
+        field_rows(vl, [("Input", "source"), ("Timing", "timing"),
+                        ("Frame rate", "framerate")], self._status_fields)
+
+        # Signal: lock / ext sync / HDMI out. (The firmware has no CVBS vs
+        # component select, so this only reports `video status`.)
         self._analog_row = QHBoxLayout()
         analog_lbl = QLabel("Signal")
-        analog_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
+        analog_lbl.setStyleSheet(LBL)
+        analog_lbl.setMinimumWidth(78)
         self._analog_row.addWidget(analog_lbl)
         self._signal_lbl = QLabel("\u2014")
-        self._signal_lbl.setStyleSheet(f"color:{TEXT};font-size:18px;{self._TRANSPARENT}")
+        self._signal_lbl.setStyleSheet(VAL)
+        self._signal_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._analog_row.addWidget(self._signal_lbl, stretch=1)
         self._analog_widget = QWidget()
+        self._analog_widget.setStyleSheet(self._TRANSPARENT)
+        self._analog_row.setContentsMargins(0, 0, 0, 0)
         self._analog_widget.setLayout(self._analog_row)
         vl.addWidget(self._analog_widget)
 
-        # Timing selector
         timing_row = QHBoxLayout()
-        timing_lbl = QLabel("Timing")
-        timing_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
-        timing_row.addWidget(timing_lbl)
-
         self.timing_combo = QComboBox()
         TIMINGS = [
             ("NTSC (480i 59.94)",    "ntsc"),
@@ -4624,133 +4613,68 @@ class SystemTab(QWidget):
         for label, val in TIMINGS:
             self.timing_combo.addItem(label, val)
         self.timing_combo.currentIndexChanged.connect(self._on_timing_changed)
+        self.timing_combo.setToolTip("Output timing. Applying restarts video output.")
         timing_row.addWidget(self.timing_combo, stretch=1)
-
-        apply_timing_btn = QPushButton("APPLY")
-        apply_timing_btn.setFixedWidth(80)
+        apply_timing_btn = QPushButton("SET OUTPUT")
+        apply_timing_btn.setToolTip("Apply the selected output timing (restarts video output)")
         apply_timing_btn.clicked.connect(self._apply_timing)
         timing_row.addWidget(apply_timing_btn)
         vl.addLayout(timing_row)
+        grid.addWidget(vid_grp, 0, 0)
 
-        timing_note = QLabel("Changing timing restarts video output")
-        timing_note.setStyleSheet(f"color:{WARN};font-size:16px;{self._TRANSPARENT}")
-        vl.addWidget(timing_note)
-
-        ll.addWidget(vid_grp)
-
-        # ·· Video Status ··
-        status_grp = QGroupBox("VIDEO STATUS")
-        sl = QVBoxLayout(status_grp)
-        sl.setSpacing(4)
-
-        self._status_fields = {}
-        for label, key in [
-            ("Source",          "source"),
-            ("Timing",          "timing"),
-            ("Frame Rate",      "framerate"),
-        ]:
-            row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:140px;{self._TRANSPARENT}")
-            row.addWidget(lbl)
-            sep = QLabel(":")
-            sep.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;{self._TRANSPARENT}")
-            sep.setFixedWidth(12)
-            row.addWidget(sep)
-            row.addSpacing(10)
-            val = QLabel("\u2014")
-            val.setStyleSheet(f"color:{TEXT};font-size:18px;font-weight:bold;{self._TRANSPARENT}")
-            row.addWidget(val, stretch=1)
-            sl.addLayout(row)
-            self._status_fields[key] = val
-
-        ll.addWidget(status_grp)
-        ll.addStretch()
-        splitter.addWidget(left)
-
-        # ── Right column: Firmware + BPM + MIDI ──
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(8, 0, 0, 0)
-        rl.setSpacing(10)
-
-        # ·· Firmware / Device Info ··
+        # ·· FIRMWARE ··
         fw_grp = QGroupBox("FIRMWARE")
         fl = QVBoxLayout(fw_grp)
-        fl.setSpacing(6)
-
+        fl.setSpacing(8)
         self._fw_fields = {}
-        for label, key in [
-            ("Version",     "version"),
-            ("Latest",      "latest"),
-            ("App",         "app"),
-            ("Uptime",      "uptime"),
-        ]:
-            row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:80px;{self._TRANSPARENT}")
-            row.addWidget(lbl)
-            val = QLabel("\u2014")
-            val.setStyleSheet(f"color:{TEXT};font-size:19px;font-weight:bold;{self._TRANSPARENT}")
-            row.addWidget(val, stretch=1)
-            fl.addLayout(row)
-            self._fw_fields[key] = val
+        field_rows(fl, [("Device", "version"), ("Latest", "latest"),
+                        ("App", "app"), ("Uptime", "uptime")], self._fw_fields)
         # App row is static — show the running version always
         self._fw_fields["app"].setText(f"v{APP_VERSION}")
 
         # Shown only when the device runs older firmware than LZX's newest
-        self.fw_update_btn = QPushButton("UPDATE FIRMWARE WITH LZX CONNECT")
+        self.fw_update_btn = QPushButton("UPDATE WITH LZX CONNECT")
         self.fw_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fw_update_btn.setStyleSheet(
             f"QPushButton{{background:{ACCENT2};border:2px solid #ffffff;"
-            f"border-radius:6px;color:#ffffff;font-size:13px;font-weight:bold;"
-            f"letter-spacing:1px;padding:8px 12px;}}"
+            f"border-radius:6px;color:#ffffff;font-size:12px;font-weight:bold;"
+            f"letter-spacing:1px;padding:6px 10px;}}"
             f"QPushButton:hover{{background:{DIM};}}"
         )
         self.fw_update_btn.setVisible(False)
         self.fw_update_btn.clicked.connect(lambda: self._open_doc(LZX_CONNECT_URL))
         fl.addWidget(self.fw_update_btn)
+        fl.addStretch()
         self._device_fw = ""
         self._latest_fw = ""
+        grid.addWidget(fw_grp, 0, 1)
 
-        rl.addWidget(fw_grp)
-
-        # ·· Device health (cpu / ram / fpga / sd), polled while tab visible ··
+        # ·· DEVICE HEALTH (polled while this tab is visible) ··
         health_grp = QGroupBox("DEVICE HEALTH")
         hl = QVBoxLayout(health_grp)
-        hl.setSpacing(6)
         self._health_fields = {}
-        for label, key in [("CPU", "cpu"), ("Memory", "ram"),
-                           ("FPGA", "fpga"), ("SD Card", "sd")]:
-            row = QHBoxLayout()
-            lbl = QLabel(label)
-            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:80px;{self._TRANSPARENT}")
-            row.addWidget(lbl)
-            val = QLabel("\u2014")
-            val.setStyleSheet(f"color:{TEXT};font-size:16px;font-weight:bold;{self._TRANSPARENT}")
-            row.addWidget(val, stretch=1)
-            hl.addLayout(row)
-            self._health_fields[key] = val
+        field_rows(hl, [("CPU", "cpu"), ("Memory", "ram"),
+                        ("FPGA", "fpga"), ("SD card", "sd")], self._health_fields)
+        hl.addStretch()
         self._cpu = {}
-        rl.addWidget(health_grp)
+        grid.addWidget(health_grp, 1, 0)
 
-        # ·· Storage (SD card as USB mass storage) ··
-        storage_grp = QGroupBox("STORAGE")
+        # ·· STORAGE (SD card as USB mass storage) ··
+        storage_grp = QGroupBox("SD CARD AS USB DRIVE")
         stg = QVBoxLayout(storage_grp)
         stg.setSpacing(6)
-
         storage_note = QLabel(
-            "Mount the Videomancer's SD card as a USB drive on your computer "
-            "to sideload programs or back up snapshots."
+            "Mount the SD card on this computer to sideload programs or back "
+            "up snapshots. Program loading pauses until you eject it."
         )
-        storage_note.setStyleSheet(f"color:{TEXT_DIM};font-size:13px;{self._TRANSPARENT}")
+        storage_note.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;{self._TRANSPARENT}")
         storage_note.setWordWrap(True)
         stg.addWidget(storage_note)
-
         self.msd_btn = QPushButton("MOUNT AS USB DRIVE")
         self.msd_btn.setEnabled(False)
         self.msd_btn.clicked.connect(self._on_msd_click)
         stg.addWidget(self.msd_btn)
+        stg.addStretch()
 
         self._msd_state = "idle"  # idle | waiting | mounted
         # Failsafe: optimistically promote waiting → mounted after 15 s
@@ -4771,56 +4695,53 @@ class SystemTab(QWidget):
         self._msd_poll_timer = QTimer(self)
         self._msd_poll_timer.setInterval(2000)
         self._msd_poll_timer.timeout.connect(self._msd_poll_status)
+        grid.addWidget(storage_grp, 1, 1)
 
-        rl.addWidget(storage_grp)
+        # ·· MIDI CC map: all 12 at once, 4 columns x 3 rows ··
+        midi_grp = QGroupBox("MIDI CC  (MSB / LSB)")
+        mg = QGridLayout(midi_grp)
+        mg.setHorizontalSpacing(16)
+        mg.setVerticalSpacing(4)
+        self._midi_cells = []
+        for i in range(12):
+            cell = QLabel(f"P{i+1}  \u2014")
+            cell.setStyleSheet(f"color:{TEXT};font-size:14px;{self._TRANSPARENT}")
+            mg.addWidget(cell, i % 3, i // 3)
+            self._midi_cells.append(cell)
+        grid.addWidget(midi_grp, 2, 0, 1, 2)
 
-        # ·· MIDI CC map ··
-        midi_grp = QGroupBox("MIDI CC ASSIGNMENTS")
-        ml = QVBoxLayout(midi_grp)
-        self.midi_table = QTextEdit()
-        self.midi_table.setReadOnly(True)
-        self.midi_table.setMaximumHeight(180)
-        self.midi_table.setStyleSheet(
-            f"background:{SURFACE};color:{TEXT};font-size:18px;"
-            f"border:1px solid {BORDER};border-radius:4px;"
-        )
-        ml.addWidget(self.midi_table)
-        rl.addWidget(midi_grp)
+        root.addLayout(grid)
 
-        # ·· Documentation ··
-        docs_grp = QGroupBox("DOCUMENTATION")
-        dl = QVBoxLayout(docs_grp)
-        dl.setSpacing(8)
-
+        # ·· Links + refresh, one compact row ··
+        links = QHBoxLayout()
+        links.setSpacing(6)
         self._doc_links = [
             # LZX's official firmware / program-library updater (Mac, Win, Linux)
-            ("LZX Connect — Firmware Updater", "https://lzxindustries.net/connect"),
+            ("LZX Connect", "https://lzxindustries.net/connect"),
+            ("Manual", "https://lzxindustries.net/instruments/videomancer/manual"),
+            ("Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
             ("Community", "https://community.lzxindustries.net/"),
-            ("Device Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
-            ("Technical Manual", "https://lzxindustries.net/instruments/videomancer/manual"),
             ("App Releases", f"https://github.com/{GITHUB_REPO}/releases"),
         ]
         for label, url in self._doc_links:
-            btn = QPushButton(f"📖  {label}")
+            btn = QPushButton(label)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(url)
             btn.setStyleSheet(
                 f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
-                f"border-radius:4px;color:{ACCENT};font-size:13px;"
-                f"font-weight:bold;padding:8px 12px;text-align:left;}}"
+                f"border-radius:4px;color:{ACCENT};font-size:12px;"
+                f"font-weight:bold;padding:5px 8px;}}"
                 f"QPushButton:hover{{background:{DIM};border-color:{ACCENT};color:#ffffff;}}"
             )
-            _url = url
-            btn.clicked.connect(lambda checked, u=_url: self._open_doc(u))
-            dl.addWidget(btn)
-
-        rl.addWidget(docs_grp)
-
-        rl.addStretch()
-        splitter.addWidget(right)
-        splitter.setSizes([400, 400])
-        scroll_lay.addWidget(splitter, stretch=1)
-        scroll.setWidget(scroll_inner)
-        root.addWidget(scroll, stretch=1)
+            btn.clicked.connect(lambda checked, u=url: self._open_doc(u))
+            links.addWidget(btn, stretch=1)
+        links.addSpacing(8)
+        self.refresh_btn = QPushButton("\u21bb  Refresh")
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.clicked.connect(self._refresh)
+        links.addWidget(self.refresh_btn)
+        root.addLayout(links)
+        root.addStretch(1)
 
     def set_connected(self, v: bool):
         self._connected = v
@@ -4848,10 +4769,8 @@ class SystemTab(QWidget):
                 val.setText("\u2014")
             for val in self._status_fields.values():
                 val.setText("\u2014")
-                val.setStyleSheet(
-                    f"color:{TEXT};font-size:18px;font-weight:bold;"
-                    f"{self._TRANSPARENT}"
-                )
+            for cell in self._midi_cells:
+                cell.setText(cell.text().split("  ")[0] + "  \u2014")
 
     @staticmethod
     def _is_true(v) -> bool:
@@ -4875,9 +4794,6 @@ class SystemTab(QWidget):
         out_timing = output.get("timing", "—")
         fps = _timing_to_fps(out_timing or timing)
         self._status_fields["framerate"].setText(fps)
-        self._status_fields["framerate"].setStyleSheet(
-            f"color:#ffffff;font-size:19px;font-weight:bold;{self._TRANSPARENT}"
-        )
 
         locked = self._is_true(data.get("locked", False))
         # Per-input detail (rc.5x firmware): lock for the active input,
@@ -4891,7 +4807,7 @@ class SystemTab(QWidget):
             parts.append("HDMI OUT " + ("ON" if self._is_true(output["hdmi_connected"]) else "OFF"))
         self._signal_lbl.setText("  \u00b7  ".join(parts))
         self._signal_lbl.setStyleSheet(
-            f"color:{TEXT if in_locked else ERROR};font-size:18px;{self._TRANSPARENT}")
+            f"color:{TEXT if in_locked else ERROR};font-size:15px;font-weight:bold;{self._TRANSPARENT}")
         # Sync source toggle buttons
         self._src_hdmi_btn.setChecked(src == "hdmi")
         self._src_analog_btn.setChecked(src == "analog")
@@ -4917,14 +4833,12 @@ class SystemTab(QWidget):
             self.on_send(f"video timing {val}")
 
     def apply_midi_cc(self, assignments: list):
-        lines = []
-        for i, a in enumerate(assignments):
-            msb = a.get("msb")
-            lsb = a.get("lsb")
-            msb = f"{msb:3d}" if isinstance(msb, int) else "  -"
-            lsb = f"{lsb:3d}" if isinstance(lsb, int) else "  -"
-            lines.append(f"P{i+1:02d}  MSB:{msb}  LSB:{lsb}")
-        self.midi_table.setText("\n".join(lines))
+        for i, cell in enumerate(self._midi_cells):
+            a = assignments[i] if i < len(assignments) and isinstance(assignments[i], dict) else {}
+            msb, lsb = a.get("msb"), a.get("lsb")
+            msb = str(msb) if isinstance(msb, int) else "-"
+            lsb = str(lsb) if isinstance(lsb, int) else "-"
+            cell.setText(f"P{i+1}  {msb} / {lsb}")
 
     def _set_source(self, src: str):
         """Switch video input source and poll until locked."""
@@ -4968,9 +4882,10 @@ class SystemTab(QWidget):
         self.fw_update_btn.setVisible(outdated)
         colour = WARN if outdated else TEXT
         self._fw_fields["latest"].setStyleSheet(
-            f"color:{colour};font-size:19px;font-weight:bold;{self._TRANSPARENT}")
+            f"color:{colour};font-size:15px;font-weight:bold;{self._TRANSPARENT}")
         if self._latest_fw and self._device_fw and not outdated:
-            self._fw_fields["latest"].setText(f"{self._latest_fw}  \u2714 up to date")
+            self._fw_fields["latest"].setText(f"{self._latest_fw}  \u2714")
+            self._fw_fields["latest"].setToolTip("Your Videomancer is on the newest firmware")
 
     def apply_health(self, kind: str, data: dict):
         f = self._health_fields
@@ -5150,27 +5065,18 @@ class StateTab(QWidget):
         self.on_refresh        = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(10)
 
-        top = QHBoxLayout()
-        title = QLabel("STATE")
-        title.setFixedHeight(32)
-        title.setStyleSheet(
-            f"color:#ffffff;font-family:'Goldplay',sans-serif;"
-            f"font-size:22px;font-weight:bold;"
-            f"letter-spacing:3px;background:transparent;border:none;"
-        )
-        top.addWidget(title)
-        top.addStretch()
-        self.refresh_btn = QPushButton("↻  Refresh")
-        self.refresh_btn.setFixedHeight(32)
+        # Kept for callers; the tab header (title + refresh) was dropped to
+        # give the lists the full height.
+        self.refresh_btn = QPushButton("↻  Refresh", self)
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setVisible(False)
         self.refresh_btn.clicked.connect(lambda: self.on_refresh and self.on_refresh())
-        top.addWidget(self.refresh_btn)
-        root.addLayout(top)
-        root.addWidget(hsep())
+
+        _note_css = (f"color:{TEXT_DIM};font-size:12px;"
+                     f"background:transparent;border:none;")
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -5183,11 +5089,15 @@ class StateTab(QWidget):
         ll.setSpacing(10)
 
         # User states (LZX's term for what we internally call user presets)
-        user_grp = QGroupBox("User States")
+        user_grp = QGroupBox("STATES ON THE DEVICE")
         ul = QVBoxLayout(user_grp)
+        user_note = QLabel("Saved control settings for the program that's "
+                           "running, stored on the Videomancer.")
+        user_note.setWordWrap(True)
+        user_note.setStyleSheet(_note_css)
+        ul.addWidget(user_note)
         self.user_list = QListWidget()
-        self.user_list.setMaximumHeight(160)
-        ul.addWidget(self.user_list)
+        ul.addWidget(self.user_list, stretch=1)
 
         user_btns = QHBoxLayout()
         apply_u = QPushButton("Apply")
@@ -5210,59 +5120,7 @@ class StateTab(QWidget):
             f"background:transparent;border:none;"
         )
         ul.addWidget(self.flash_lbl)
-        ll.addWidget(user_grp)
-
-        ll.addStretch()
-
-        # ·· Preset / Snapshot explainer ··
-        _title_css = (
-            f"color:#ffffff;font-size:15px;font-weight:bold;"
-            f"letter-spacing:2px;background:transparent;border:none;"
-        )
-        _body_css = (
-            f"color:{TEXT};font-size:14px;line-height:150%;"
-            f"background:transparent;border:none;"
-        )
-
-        def _accent_line():
-            line = QFrame()
-            line.setFrameShape(QFrame.Shape.HLine)
-            line.setFixedHeight(2)
-            line.setFixedWidth(60)
-            line.setStyleSheet(
-                f"background:{ACCENT2};border:none;color:{ACCENT2};"
-            )
-            return line
-
-        preset_title = QLabel("STATE")
-        preset_title.setStyleSheet(_title_css)
-        preset_body = QLabel(
-            "A saved snapshot of Motion and Parameter values for the "
-            "currently loaded program, stored on the device."
-        )
-        preset_body.setWordWrap(True)
-        preset_body.setStyleSheet(_body_css)
-
-        snap_title = QLabel("SNAPSHOT")
-        snap_title.setStyleSheet(_title_css)
-        snap_body = QLabel(
-            "A local JSON file on this computer capturing the current program "
-            "+ its user states + global settings. Use it to back up or share "
-            "a full session."
-        )
-        snap_body.setWordWrap(True)
-        snap_body.setStyleSheet(_body_css)
-
-        ll.addWidget(preset_title)
-        ll.addWidget(_accent_line())
-        ll.addSpacing(4)
-        ll.addWidget(preset_body)
-        ll.addSpacing(12)
-        ll.addWidget(snap_title)
-        ll.addWidget(_accent_line())
-        ll.addSpacing(4)
-        ll.addWidget(snap_body)
-        ll.addSpacing(4)
+        ll.addWidget(user_grp, stretch=1)
 
         splitter.addWidget(left)
 
@@ -5272,8 +5130,13 @@ class StateTab(QWidget):
         rl.setContentsMargins(8, 0, 0, 0)
         rl.setSpacing(8)
 
-        snap_grp = QGroupBox("File Snapshots")
+        snap_grp = QGroupBox("SNAPSHOTS ON THIS COMPUTER")
         sl = QVBoxLayout(snap_grp)
+        snap_note = QLabel("Files with the program, its device states and "
+                           "global settings — for backups or sharing a session.")
+        snap_note.setWordWrap(True)
+        snap_note.setStyleSheet(_note_css)
+        sl.addWidget(snap_note)
 
         snap_top = QHBoxLayout()
         self.snap_label = QLineEdit()
@@ -5288,6 +5151,10 @@ class StateTab(QWidget):
         sl.addLayout(snap_top)
 
         self.snap_list = QListWidget()
+        # Two-line entries wrap instead of scrolling sideways
+        self.snap_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.snap_list.setWordWrap(True)
+        self.snap_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         sl.addWidget(self.snap_list, stretch=1)
 
         snap_btns = QHBoxLayout()
@@ -5362,7 +5229,8 @@ class StateTab(QWidget):
                 ts = dt.strftime("%Y-%m-%d %H:%M")
             except Exception:
                 pass
-            item = QListWidgetItem(f"{s['label']}  ·  {s['program']}  ·  {ts}")
+            item = QListWidgetItem(f"{s['label']}\n{s['program']}  ·  {ts}")
+            item.setToolTip(f"{s['label']}\n{s['program']} — saved {ts}")
             item.setData(Qt.ItemDataRole.UserRole, s)
             self.snap_list.addItem(item)
         if not snaps:
@@ -5597,6 +5465,9 @@ class VideomancerApp(QMainWindow):
         def _scrollable(w):
             sa = QScrollArea()
             sa.setWidgetResizable(True)
+            # Vertical only: the window's minimum width (below) always fits
+            # the widest tab, so nothing is ever cut off sideways.
+            sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             sa.setFrameShape(QFrame.Shape.NoFrame)
             sa.setStyleSheet("QScrollArea{background:transparent;border:none;}")
             sa.setWidget(w)
@@ -5605,6 +5476,13 @@ class VideomancerApp(QMainWindow):
         self.tabs.addTab(_scrollable(self.param_tab),  "CONTROL")
         self.tabs.addTab(_scrollable(self.system_tab), "SYSTEM")
         self.tabs.addTab(_scrollable(self.state_tab),  "STATE")
+        widest = max(t.minimumSizeHint().width() for t in
+                     (self.prog_tab, self.param_tab, self.system_tab, self.state_tab))
+        self.setMinimumWidth(widest + 100)  # tab frame, margins, vertical scrollbar
+        # Default size: wide enough for every tab, no taller than the screen
+        scr = QApplication.primaryScreen()
+        avail_h = scr.availableGeometry().height() - 40 if scr else 1020
+        self.resize(max(self.width(), self.minimumWidth()), min(self.height(), avail_h))
         self._install_shortcuts()
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.conn_bar.data_refresh_btn.clicked.connect(self._on_tab_refresh)
