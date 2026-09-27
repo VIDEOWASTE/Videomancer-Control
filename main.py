@@ -209,6 +209,7 @@ class _UpdateDownloader(QThread):
 
 # ── Multi-device: global registry of ports claimed by open windows ────
 _claimed_ports: set = set()
+_orphan_threads: set = set()   # network QThreads outliving a closed window
 _app_windows: list = []      # all open VideomancerApp windows
 
 
@@ -5390,6 +5391,7 @@ class VideomancerApp(QMainWindow):
                 f"Load failed ({self._pending_load_error})" if self._pending_load_error
                 else "Load timed out — device didn't confirm"))
         self._pending_load_error = ""
+        self._last_load_request = ("", 0.0)   # (program, monotonic) we asked for
 
         self._setup_ui()
 
@@ -5719,6 +5721,14 @@ class VideomancerApp(QMainWindow):
             f"Download and install it now? The app will restart when the "
             f"update is ready.",
         ):
+            return
+
+        if sys.platform != "darwin":
+            # In-place install is macOS-only; hand Windows users the download.
+            from PyQt6.QtGui import QDesktopServices
+            from PyQt6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(self._update_url or
+                                          f"https://github.com/{GITHUB_REPO}/releases/latest"))
             return
 
         # Refuse if we can't locate our own .app (running from source etc.)
@@ -6075,12 +6085,10 @@ fi
                     QTimer.singleShot(1500, self._request_state)
                     QTimer.singleShot(1500, self._fetch_presets)
                     QTimer.singleShot(1800, self._fetch_tss_readback_auto)
-                    QTimer.singleShot(2500, self._fetch_tss_readback)
                 else:
                     # preset apply ok (TSS change)
                     self.status_bar.showMessage("Applied", 1000)
                     QTimer.singleShot(500, self._fetch_tss_readback_auto)
-                    QTimer.singleShot(1000, self._fetch_tss_readback)
 
             else:
                 # JSON payload — could be state or preset list
@@ -6154,17 +6162,21 @@ fi
                     params = data.get("parameters", [])
                     running = data.get("name", "")
                     if running and self._active_program and running != self._active_program:
-                        # The device answers `program load X` with @program:ok
-                        # even when X fails to load and the previous program
-                        # keeps running (seen with Bleach on rc.55). `program
-                        # info` is a direct query, so it wins over our guess.
+                        # `program info` is a direct query, so it wins over our
+                        # guess. Two ways to get here: the device answered
+                        # `program load X` with @program:ok but X failed and the
+                        # old program kept running (seen with Bleach on rc.55),
+                        # or the program was changed on the hardware itself.
                         wanted = self._active_program
-                        self.console.append("error", "load",
-                            f"Device is running {running!r}, not {wanted!r}")
-                        self.status_bar.showMessage(
-                            f"\u26a0 Couldn't load {wanted} — the Videomancer is still "
-                            f"running {running}. The program file may be damaged or "
-                            f"incompatible; try reinstalling it with LZX Connect.", 12000)
+                        req_name, req_time = self._last_load_request
+                        if req_name == wanted and time.monotonic() - req_time < 20.0:
+                            self.console.append("error", "load",
+                                f"Device is running {running!r}, not {wanted!r}")
+                            self.status_bar.showMessage(
+                                f"\u26a0 Couldn't load {wanted} — the Videomancer is still "
+                                f"running {running}. The program file may be damaged or "
+                                f"incompatible; try reinstalling it with LZX Connect.", 12000)
+                        self._last_load_request = ("", 0.0)
                         self._set_active_program(running, force=True)
                         return   # force=True re-requests info for the real program
                     self.console.append("ok", "program-info", str(data))
@@ -6293,6 +6305,8 @@ fi
                 # future unrelated status updates don't keep being blocked.
                 if self._pending_load and prog == self._pending_load:
                     self._pending_load = None
+                if prog == self._active_program:
+                    self._active_program_lock_until = 0.0   # device confirmed
                 self._set_active_program(prog)
         if vstd:
             self._sb_vid.setText(
@@ -6337,6 +6351,7 @@ fi
         self.status_bar.showMessage(f"Loading {name}…")
         self.console.append("cmd", f"program load {name}", "")
         self._pending_load_error = ""
+        self._last_load_request = (name, time.monotonic())
         self._worker.load_program(name)
         self._load_watchdog.start()
 
@@ -6370,14 +6385,15 @@ fi
         self._sparkle.trigger(cx, cy)
 
     def _set_active_program(self, name: str, force: bool = False):
-        # Lock window: keep status polls from reverting this for 15 seconds.
-        # Polls that match `name` pass through and reset the lock; polls
-        # reporting a different program are ignored until the device catches up.
-        self._active_program_lock_until = time.monotonic() + 15.0
         if name == self._active_program and not force:
             # Routine status poll confirming what we already show — don't
             # re-fetch program info, rebuild lists or clear status text.
             return
+        # Lock window: keep stale status polls from reverting this change for
+        # up to 15 s. The first poll that confirms `name` clears it (see
+        # _on_status_update), so program changes made on the hardware show up
+        # on the next poll instead of being ignored.
+        self._active_program_lock_until = time.monotonic() + 15.0
         self.console.append("log", "", f"[active] {self._active_program!r} → {name!r}")
         self._active_program = name
         self.prog_tab.set_active(name)
@@ -6498,11 +6514,6 @@ fi
             # RC11: modulation set <ch> <val> <field> — confirmed working
             cmd = f"modulation set {index} {value} {field}"
             self._queue_cmd(f"{field}{index}", cmd)
-
-    def _fetch_tss_readback(self):
-        """Resync TSS from live state. (Used to read preset slot 0, which
-        could overwrite the controls with stale preset values.)"""
-        self._fetch_tss_readback_auto()
 
     def _fetch_tss_readback_auto(self):
         """Fetch full program state to sync TSS sliders from device."""
@@ -6834,8 +6845,12 @@ fi
         self._load_watchdog.stop()
         self._cmd_flush.stop()
         for t in (getattr(self, '_update_checker', None), getattr(self, '_fw_checker', None)):
-            if t is not None and t.isRunning():
-                t.wait(1500)   # network threads finish within their timeout
+            if t is not None and t.isRunning() and not t.wait(1500):
+                # Still inside urlopen (10 s timeout). Keep a reference so the
+                # QThread isn't destroyed while running — Qt aborts on that.
+                t.setParent(None)
+                _orphan_threads.add(t)
+                t.finished.connect(lambda t=t: _orphan_threads.discard(t))
         if self._monitor_window is not None:
             self._monitor_window.close()
             self._monitor_window = None
