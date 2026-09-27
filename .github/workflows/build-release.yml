@@ -222,15 +222,16 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
-            ### Highlights
+            ### New in 2.6.1
+            - **Time / Space / Slope knobs fixed** — they now send the firmware's current command form, so turning them changes the device and the knobs no longer snap back.
+            - Program changes made on the Videomancer itself show up within a few seconds.
+
+            ### Highlights of 2.6
             - **One universal Mac download** — a single DMG runs natively on Apple Silicon and Intel.
-            - **In-app updates actually fire** — the update check was silently failing in 2.5; it now downloads, installs and relaunches in place.
-            - **Real parameter names and units** from each program (e.g. Delay Depth 1025, not 50%); unused slots are dimmed.
-            - **Signal status row** on the System tab (lock, external sync, HDMI out).
-            - **Firmware check** against LZX's latest release, with a one-click LZX Connect link; fixed Technical Manual link.
-            - **Smoother, more reliable control sync** — knob drags are rate-limited, toggles no longer snap back, hardware knob moves show up within a second, Play/Tap now use the firmware's real commands.
-            - **Favorites & recent programs**, **device health** panel (CPU / memory / FPGA / SD), **keyboard shortcuts** (Space, T, ⌘1–4, ⌘F, ⌘R).
-            - Fixes: MIDI CC crash, preset names with spaces, tap-tempo write race, updater guidance when run from Downloads.
+            - **In-app updates actually fire** — downloads, installs and relaunches in place.
+            - **Real parameter names and units** from each program; unused slots are dimmed.
+            - **Smoother, more reliable control sync**, and failed program loads are reported instead of hidden.
+            - **Firmware check** with a one-click LZX Connect link, **device health**, **favorites & recent programs**, **Randomize / Undo**, **keyboard shortcuts**, cleaner System and State tabs.
 
             ### Downloads
             - **macOS (Apple Silicon + Intel)**: `VideomancerControl_macOS.dmg` — open it and drag the app to Applications.

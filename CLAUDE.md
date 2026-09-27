@@ -8,7 +8,7 @@ The end-user-facing doc is `README.md` — keep user install / usage instruction
 
 ## Two unrelated projects share this directory
 
-1. **Videomancer Control** — everything at the root. Python 3.10+/PyQt6 desktop companion app for LZX Industries' Videomancer hardware. Ships as a signed+notarized macOS `.app` and Windows `.exe`. Current version: **2.6** (see `APP_VERSION` in `main.py`).
+1. **Videomancer Control** — everything at the root. Python 3.10+/PyQt6 desktop companion app for LZX Industries' Videomancer hardware. Ships as a signed+notarized macOS `.app` and Windows `.exe`. Current version: **2.6.1** (see `APP_VERSION` in `main.py`).
 2. **FairWaste/** — self-contained Swift/Metal iOS+macOS project (camera-input real-time frame store). No code dependency on Videomancer; they just share a parent folder.
 
 ---
@@ -42,6 +42,7 @@ Protocol gotchas (verified on firmware 1.0.0-rc.55):
 - The reply key is the command's first word, so `program state`/`info`/`presets list` all come back as `@program:` and are told apart by JSON keys. Error keys are numeric codes (`0x58000000 | n`), so an error can't be tied to the command that caused it.
 - Transport is `transport play|stop|bpm <x100>` — there is no `start` or `tap` (tap tempo is computed in the app).
 - `program state` reports toggles as 0/1; the app sends 1023 for ON.
+- Time/Space/Slope are positional: `modulation set <ch> <manual> <time> <space> <slope>`. The old `modulation set <ch> <val> <t|sp|sl>` form (RC11) does not work on current firmware.
 - Knob drags go through `_queue_cmd` (~30 Hz coalescing); polls through `_poll_once` (one in flight); device readback for a channel is ignored for `EDIT_GUARD_S` after a local edit.
 
 ## Videomancer — release flow

@@ -13,7 +13,7 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.6.1"
 GITHUB_REPO = "VIDEOWASTE/Videomancer-Control"
 
 import sys
@@ -3173,8 +3173,23 @@ class ChannelCard(QWidget):
             lbl.setText(labels[i])
 
     def _update_tss_enabled(self, op_id: int):
-        """Style the operator combo to indicate active LFO vs disabled."""
+        """Style the operator combo to indicate active LFO vs disabled, and
+        lock Time/Space/Slope while the source is Disabled — the firmware
+        ignores them then (verified on rc.55), so turning them did nothing."""
         active = op_id != 0
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        for knob in getattr(self, "_tss_sliders", []):
+            if knob.isEnabled() == active:
+                continue
+            knob.setEnabled(active)
+            if active:
+                knob.setGraphicsEffect(None)
+                knob.setToolTip("")
+            else:
+                eff = QGraphicsOpacityEffect(knob)
+                eff.setOpacity(0.35)
+                knob.setGraphicsEffect(eff)
+                knob.setToolTip("Pick a modulation source to use Time / Space / Slope")
         # ModBar stays active — shows output regardless of operator
         if active:
             # Lit up — purple background, white text
@@ -3459,6 +3474,7 @@ class ParametersTab(QWidget):
             col12.addWidget(tss_lbl12)
             tss12_row.addLayout(col12)
             tss12_row.addStretch(1)
+        card12._update_tss_enabled(card12.get_operator())   # new knobs start locked
         fader_v.addLayout(tss12_row)
         fader_v.addSpacing(2)
 
@@ -3618,18 +3634,18 @@ class ParametersTab(QWidget):
     def _recently_edited(self, i: int, now: float) -> bool:
         return now - self._last_sent.get(f"edit_time_{i}", 0) < EDIT_GUARD_S
 
-    def _note_device_value(self, i: int, m=None, sr=None):
+    def _note_device_value(self, i: int, m=None, sr=None, t=None, sp=None, sl=None):
         """Record a value the device reported, so the send-dedup compares
         against the device's real state rather than our last send."""
-        if m is not None:
-            self._last_sent[f"m{i}"] = m
-        if sr is not None:
-            self._last_sent[f"sr{i}"] = sr
+        for key, val in (("m", m), ("sr", sr), ("t", t), ("sp", sp), ("sl", sl)):
+            if val is not None:
+                self._last_sent[f"{key}{i}"] = val
 
     def set_tss_panel(self, ch: int, t: int, sp: int, sl: int):
         """Update per-card TSS sliders from device state."""
         if ch < len(self.channels):
             self.channels[ch].set_tss(t, sp, sl, silent=True)
+            self._note_device_value(ch, t=t, sp=sp, sl=sl)
 
     def apply_state(self, m: list, t: list, sp: list, sl: list, sr: list):
         """Apply full state including TSS panel — skip recently edited channels."""
@@ -6497,6 +6513,10 @@ fi
         if is_toggle:
             self.console.append("cmd", f"P{index+1} manual → {value}", "")
             self._worker.send(cmd)
+        elif self._pending_cmds.get(f"m{index}", "").count(" ") > 3:
+            # A Time/Space/Slope change for this channel is still queued —
+            # keep sending the full form so it isn't dropped.
+            self._queue_cmd(f"m{index}", self._full_mod_set(index))
         else:
             self._queue_cmd(f"m{index}", cmd)
 
@@ -6511,9 +6531,18 @@ fi
             self.console.append("cmd", f"P{index+1} operator → {value}", "")
             self._worker.send(cmd)
         else:
-            # RC11: modulation set <ch> <val> <field> — confirmed working
-            cmd = f"modulation set {index} {value} {field}"
-            self._queue_cmd(f"{field}{index}", cmd)
+            # Time/Space/Slope are positional after the manual value:
+            #   modulation set <ch> <manual> <time> <space> <slope>
+            # (The old `modulation set <ch> <val> <t|sp|sl>` form was RC11-era;
+            # current firmware reads the field name as a bad positional arg,
+            # so TSS never changed and the knob snapped back on the next poll.)
+            self._queue_cmd(f"m{index}", self._full_mod_set(index))
+
+    def _full_mod_set(self, index: int) -> str:
+        """`modulation set` with manual + time/space/slope from the card."""
+        card = self.param_tab.channels[index]
+        t, sp, sl = card.get_tss()
+        return f"modulation set {index} {card.get_manual()} {t} {sp} {sl}"
 
     def _fetch_tss_readback_auto(self):
         """Fetch full program state to sync TSS sliders from device."""
@@ -6666,10 +6695,8 @@ fi
                     if card._is_toggle:
                         m = PARAM_RANGE if m > 0 else 0   # device reports 0/1
                     self._worker.send(f"modulation source {i} {int(sr_list[i])}")
-                    self._worker.send(f"modulation set {i} {m}")
-                    for field, vals in (("t", t_list), ("sp", sp_list), ("sl", sl_list)):
-                        if i < len(vals):
-                            self._worker.send(f"modulation set {i} {int(vals[i])} {field}")
+                    tss = [int(v[i]) if i < len(v) else 512 for v in (t_list, sp_list, sl_list)]
+                    self._worker.send(f"modulation set {i} {m} {tss[0]} {tss[1]} {tss[2]}")
                     # keep in-flight polls from snapping the UI back
                     self.param_tab._last_sent[f"edit_time_{i}"] = now
                 self.param_tab.apply_state(parameters, t_list, sp_list, sl_list, sr_list)
