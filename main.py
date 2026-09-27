@@ -13,8 +13,8 @@ Run:
     python3 main.py
 """
 
-APP_VERSION = "2.5"
-GITHUB_REPO = "VIDEOWASTE/VIDEOMANCER-Control-Interface"
+APP_VERSION = "2.6"
+GITHUB_REPO = "VIDEOWASTE/Videomancer-Control"
 
 import sys
 import json
@@ -65,11 +65,54 @@ class _UpdateChecker(QThread):
             tag = data.get("tag_name", "")
             remote_ver = tag.lstrip("v")
             local_ver = APP_VERSION.lstrip("v")
-            if self._is_newer(remote_ver, local_ver):
+            if _UpdateDownloader._is_newer(remote_ver, local_ver):
                 html_url = data.get("html_url", "")
                 self.update_available.emit(remote_ver, html_url)
         except Exception:
             pass  # Network errors are non-fatal
+
+
+LZX_CONNECT_URL = "https://lzxindustries.net/connect"
+FIRMWARE_REPO = "lzxindustries/videomancer-firmware"
+
+
+def _fw_version_key(v: str):
+    """Sort key for Videomancer firmware versions like '1.0.0-rc.55'.
+    Pre-releases sort before the matching final release. None if unparseable."""
+    m = re.match(r"\s*v?(\d+)\.(\d+)\.(\d+)(?:-rc\.?(\d+))?", v or "")
+    if not m:
+        return None
+    a, b, c, rc = m.groups()
+    return (int(a), int(b), int(c), 0 if rc else 1, int(rc or 0))
+
+
+class _FirmwareChecker(QThread):
+    """Finds the newest Videomancer firmware on LZX's GitHub releases.
+    Firmware tags look like `videomancer/1.0.0-rc.55`; the same repo also
+    carries `connect/…` and `programs/…` tags, which are ignored."""
+    latest_found = pyqtSignal(str)
+
+    def run(self):
+        try:
+            from urllib.request import urlopen, Request
+            url = f"https://api.github.com/repos/{FIRMWARE_REPO}/releases?per_page=50"
+            req = Request(url, headers={"Accept": "application/vnd.github+json",
+                                        "User-Agent": "VideomancerControl"})
+            with urlopen(req, timeout=10) as resp:
+                releases = json.loads(resp.read().decode())
+            best = None
+            for r in releases:
+                tag = r.get("tag_name", "")
+                if not tag.startswith("videomancer/") or r.get("draft"):
+                    continue
+                ver = tag.split("/", 1)[1]
+                key = _fw_version_key(ver)
+                if key and (best is None or key > best[0]):
+                    best = (key, ver)
+            if best:
+                self.latest_found.emit(best[1])
+        except Exception:
+            pass  # offline is fine — the check is advisory
 
 
 class _UpdateDownloader(QThread):
@@ -83,14 +126,9 @@ class _UpdateDownloader(QThread):
     @staticmethod
     def asset_name_for_platform() -> Optional[str]:
         if sys.platform == "darwin":
-            import platform
-            # arm64 → Apple Silicon build; x86_64 → Intel build.
-            # Running an Apple-Silicon binary under Rosetta still reports
-            # "x86_64" via platform.machine(), which means Intel Macs and
-            # translated processes both correctly land on the Intel zip.
-            if platform.machine() == "arm64":
-                return "VideomancerControl_macOS.zip"
-            return "VideomancerControl_macOS_Intel.zip"
+            # Universal2 build since 2.6. Releases still publish a
+            # `_macOS_Intel.zip` copy so installs <= 2.5 can update.
+            return "VideomancerControl_macOS.zip"
         if sys.platform.startswith("win"):
             return "VideomancerControl_Windows.zip"
         return None
@@ -188,6 +226,20 @@ ERROR    = "#ff4466"
 WARN     = "#e0d0ff"
 
 PARAM_RANGE = 1023   # 0–1023, centre = 512
+
+# After the user edits a channel, ignore device readback for that channel
+# this long so an in-flight poll reply can't yank the control back. Short
+# enough that hardware knob moves show up promptly afterwards.
+EDIT_GUARD_S = 1.0
+
+
+def _cmd_safe_name(name: str, fallback: str = "preset") -> str:
+    """Make a preset name safe to embed in a space-delimited serial command.
+    The firmware's quoting rules are undocumented, so collapse whitespace to
+    underscores and drop anything that isn't printable ASCII."""
+    name = re.sub(r"\s+", "_", str(name).strip())
+    name = re.sub(r"[^\x21-\x7e]", "", name)
+    return name or fallback
 
 # ── Video Monitor (floating capture card preview) ─────────────────────
 
@@ -1259,12 +1311,23 @@ class _SplashWidget(QWidget):
 
 # ── Programs tab ───────────────────────────────────────────────────────
 
+def _app_settings():
+    from PyQt6.QtCore import QSettings
+    return QSettings("VIDEOWASTE", "Videomancer Control")
+
+
 class ProgramsTab(QWidget):
+    RECENT_MAX = 10
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._all: List[str] = []
         self._active: Optional[str] = None
         self._connected = False
+        st = _app_settings()
+        self._favorites: List[str] = list(st.value("programs/favorites", [], type=list) or [])
+        self._recents: List[str] = list(st.value("programs/recents", [], type=list) or [])
+        self._view = "all"   # all | fav | recent
 
         # Outer stack — splash OR browser
         self._stack = QWidget()
@@ -1291,6 +1354,26 @@ class ProgramsTab(QWidget):
         self.search.setPlaceholderText("🔍  filter programs…")
         self.search.textChanged.connect(self._filter)
         ll.addWidget(self.search)
+
+        # View switch: all / favourites / recently loaded
+        view_row = QHBoxLayout()
+        view_row.setSpacing(4)
+        self._view_btns = {}
+        for key, label in (("all", "ALL"), ("fav", "★ FAVORITES"), ("recent", "RECENT")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setChecked(key == "all")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
+                f"border-radius:4px;color:{TEXT_DIM};font-size:10px;font-weight:bold;"
+                f"padding:3px 6px;}}"
+                f"QPushButton:checked{{background:{DIM};color:#ffffff;border-color:#ffffff;}}"
+            )
+            b.clicked.connect(lambda _c, k=key: self._set_view(k))
+            view_row.addWidget(b, stretch=1)
+            self._view_btns[key] = b
+        ll.addLayout(view_row)
 
         self.count_lbl = QLabel("—")
         self.count_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
@@ -1348,6 +1431,18 @@ class ProgramsTab(QWidget):
         rl.addWidget(self.desc_lbl)
 
         rl.addSpacing(16)
+
+        self.fav_btn = QPushButton("☆  ADD TO FAVORITES")
+        self.fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fav_btn.setStyleSheet(
+            f"QPushButton{{background:transparent;border:1px solid {BORDER};"
+            f"border-radius:6px;color:{TEXT_DIM};font-size:11px;font-weight:bold;"
+            f"letter-spacing:1px;padding:4px 12px;}}"
+            f"QPushButton:hover{{border-color:#ffffff;color:#ffffff;}}"
+        )
+        self.fav_btn.setVisible(False)
+        self.fav_btn.clicked.connect(self._toggle_favorite)
+        rl.addWidget(self.fav_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.load_btn = QPushButton("⬤  LOAD PROGRAM")
         self.load_btn.setObjectName("primary")
@@ -1438,6 +1533,11 @@ class ProgramsTab(QWidget):
 
     def set_active(self, name: str):
         self._active = name
+        if name:
+            self._recents = ([name] + [r for r in self._recents if r != name])[:self.RECENT_MAX]
+            _app_settings().setValue("programs/recents", self._recents)
+            if self._view == "recent":
+                self._rebuild(self.search.text())
         self._highlight_active()
         if self._selected == name:
             self.active_pill.setVisible(True)
@@ -1445,6 +1545,7 @@ class ProgramsTab(QWidget):
         elif not self._selected:
             # Nothing selected — show the active program in the panel
             self.name_lbl.setText(name)
+            self._update_fav_btn(name)
             self.active_pill.setVisible(True)
             self.desc_lbl.setVisible(False)
             self.load_btn.setText("⬤  RELOAD PROGRAM")
@@ -1464,20 +1565,50 @@ class ProgramsTab(QWidget):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             raw = item.data(Qt.ItemDataRole.UserRole)
+            label = f"★ {raw}" if raw in self._favorites else raw
             if raw == self._active:
-                item.setText(f"▶  {raw}")
+                item.setText(f"▶  {label}")
                 item.setForeground(QColor('#ffffff'))
             else:
-                item.setText(raw)
+                item.setText(label)
                 item.setForeground(QColor(TEXT))
 
     def _filter(self, text):
         self._rebuild(text)
 
+    def _set_view(self, key: str):
+        self._view = key
+        for k, b in self._view_btns.items():
+            b.setChecked(k == key)
+        self._rebuild(self.search.text())
+
+    def _toggle_favorite(self):
+        name = self._selected or self._active
+        if not name:
+            return
+        if name in self._favorites:
+            self._favorites.remove(name)
+        else:
+            self._favorites.append(name)
+        _app_settings().setValue("programs/favorites", self._favorites)
+        self._update_fav_btn(name)
+        self._rebuild(self.search.text())
+
+    def _update_fav_btn(self, name: Optional[str]):
+        self.fav_btn.setVisible(bool(name))
+        fav = name in self._favorites
+        self.fav_btn.setText("★  FAVORITE" if fav else "☆  ADD TO FAVORITES")
+
     def _rebuild(self, filt):
         self.list_widget.clear()
         fl = filt.lower().strip()
-        for name in self._all:
+        if self._view == "fav":
+            names = [n for n in self._all if n in self._favorites]
+        elif self._view == "recent":
+            names = [n for n in self._recents if n in self._all]
+        else:
+            names = self._all
+        for name in names:
             if fl and fl not in name.lower():
                 continue
             item = QListWidgetItem(name)
@@ -1492,6 +1623,7 @@ class ProgramsTab(QWidget):
         name = item.data(Qt.ItemDataRole.UserRole)
         self._selected = name
         self.name_lbl.setText(name)
+        self._update_fav_btn(name)
         self.active_pill.setVisible(name == self._active)
         self.desc_lbl.setText("")
         self.desc_lbl.setVisible(False)
@@ -2570,6 +2702,9 @@ class ChannelCard(QWidget):
         self._param_step = 0
         self._param_values = []
         self._param_type = ""
+        # Only fade "Unused" slots once a program has reported its parameters
+        self._program_loaded = False
+        self.on_value_label_refresh = None
 
         self.on_manual_change = None
         self.on_mod_change    = None
@@ -2870,6 +3005,11 @@ class ChannelCard(QWidget):
 
         if not hasattr(self, '_param_name_lbl'):
             return
+        # Programs mark spare slots "Unused" (or omit them) — fade those so the
+        # controls that matter stand out.
+        unused = (not name) or name.strip().lower() == "unused"
+        self._set_unused(unused and self._program_loaded)
+        self._refresh_value_label()
         if name and name not in (f"P{self.index+1}", f"{self.index+1}", ""):
             self._num_lbl.setText(f"{self.index+1} -")
             self._param_name_lbl.setText(name.upper())
@@ -2878,9 +3018,35 @@ class ChannelCard(QWidget):
             self._num_lbl.setText(f"{self.index+1}")
             self._param_name_lbl.setVisible(False)
 
+    def _set_unused(self, unused: bool):
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        if unused:
+            eff = QGraphicsOpacityEffect(self)
+            eff.setOpacity(0.35)
+            self.setGraphicsEffect(eff)
+        else:
+            self.setGraphicsEffect(None)
+        self.setToolTip("Not used by this program" if unused else "")
+
     def _format_value(self, raw: int) -> str:
-        """Format a raw 0-1023 value — always smooth 0-100%."""
-        return f"{round(raw / 10.23)}%"
+        """Format a raw 0-1023 value in the program's own units.
+
+        `program info` reports each parameter's real range (e.g. Delay Depth
+        0-2048, Diff Gain 0-200). 0-100 ranges read as a percentage; anything
+        else shows the scaled value the program actually receives."""
+        lo, hi = self._param_min, self._param_max
+        if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)) \
+                or hi <= lo or (lo, hi) == (0, 100):
+            return f"{round(raw / 10.23)}%"
+        return f"{round(lo + (raw / PARAM_RANGE) * (hi - lo))}"
+
+    def _refresh_value_label(self):
+        """Re-render the value readout after the parameter range changes."""
+        if self.val_lbl and (self.knob or self.slider):
+            src = self.knob or self.slider
+            self.val_lbl.setText(self._format_value(src.value()))
+        if self.slider is not None and self.on_value_label_refresh:
+            self.on_value_label_refresh(self.slider.value())
 
     def set_manual(self, value: int, silent: bool = True):
         self._updating = silent
@@ -3154,6 +3320,20 @@ class ParametersTab(QWidget):
 
         tl.addStretch()
 
+        # Randomize the program's knobs; Undo steps back through randomizes
+        self._history: List[tuple] = []
+        self.random_btn = QPushButton("\U0001F3B2  RANDOMIZE")
+        self.random_btn.setToolTip("Randomize knobs 1–6 and switches 7–10 (R).\n"
+                                   "Dry/Wet, Bypass and unused controls are left alone.")
+        self.undo_btn = QPushButton("\u21B6  UNDO")
+        self.undo_btn.setToolTip("Restore the values from before the last randomize (\u2318Z)")
+        for b in (self.random_btn, self.undo_btn):
+            b.setFixedHeight(30)
+            b.setEnabled(False)
+            tl.addWidget(b)
+        self.random_btn.clicked.connect(self.randomize)
+        self.undo_btn.clicked.connect(self.undo)
+
         root.addWidget(transport_grp)
         root.addSpacing(4)
 
@@ -3244,6 +3424,9 @@ class ParametersTab(QWidget):
         # Wire val_lbl_12 to update when slider moves
         if card12.slider:
             card12.slider.valueChanged.connect(
+                lambda v: self.val_lbl_12.setText(card12._format_value(v))
+            )
+            card12.on_value_label_refresh = (
                 lambda v: self.val_lbl_12.setText(card12._format_value(v))
             )
 
@@ -3351,9 +3534,12 @@ class ParametersTab(QWidget):
 
     def set_connected(self, v: bool):
         self._connected = v
+        self.reset_sync_caches()
         self._set_enabled(v)
         self.refresh_btn.setEnabled(v)
         self.start_btn.setEnabled(v)
+        self.random_btn.setEnabled(v)
+        self.undo_btn.setEnabled(v and bool(self._history))
         self.stop_btn.setEnabled(v)
         self.tap_btn.setEnabled(v)
         self.bpm_slider.setEnabled(v)
@@ -3365,6 +3551,8 @@ class ParametersTab(QWidget):
                 card.set_manual(0, silent=True)
                 card.set_output(0)
                 card._num_lbl.setText(f"{card.index+1}")
+                card._program_loaded = False
+                card._set_unused(False)
                 if hasattr(card, '_param_name_lbl'):
                     card._param_name_lbl.setVisible(False)
                 if hasattr(card, '_tss_sliders') and card._tss_sliders:
@@ -3372,10 +3560,13 @@ class ParametersTab(QWidget):
 
     def set_program(self, name: str):
         self.prog_lbl.setText(name or "No program loaded")
+        self._history.clear()          # undo steps belong to one program
+        self.undo_btn.setEnabled(False)
 
     def apply_param_labels(self, params: list):
         """Update channel card labels from program info parameter names."""
         for i, card in enumerate(self.channels):
+            card._program_loaded = bool(params)
             if i < len(params):
                 p = params[i]
                 card.set_param_info(p)
@@ -3389,6 +3580,51 @@ class ParametersTab(QWidget):
             else:
                 self._p12_name_lbl.setText("INTENSITY")
 
+    def _capture(self) -> tuple:
+        return ([c.get_manual() for c in self.channels],
+                [c.get_operator() for c in self.channels])
+
+    def randomize(self):
+        import random
+        self._history = (self._history + [self._capture()])[-20:]
+        for i, card in enumerate(self.channels):
+            name = card._param_name_lbl.text().lower()
+            if card.graphicsEffect() is not None or i >= 10 or "bypass" in name:
+                continue   # unused slot, Bypass, or the Dry/Wet fader
+            v = random.choice((0, PARAM_RANGE)) if card._is_toggle else random.randint(0, PARAM_RANGE)
+            card.set_manual(v, silent=True)
+            self._manual_changed(i, v)
+        self.undo_btn.setEnabled(True)
+
+    def undo(self):
+        if not self._history:
+            return
+        m, sr = self._history.pop()
+        for i, card in enumerate(self.channels):
+            card.set_manual(m[i], silent=True)
+            self._manual_changed(i, m[i])
+            if sr[i] != card.get_operator():
+                card.set_operator(sr[i])
+                self._mod_changed(i, "sr", sr[i])
+        self.undo_btn.setEnabled(bool(self._history))
+
+    def reset_sync_caches(self):
+        """Forget what we last sent / last saw — call on connect, disconnect
+        and program change so stale values can't suppress sends or updates."""
+        self._last_sent.clear()
+        self._prev_mod = [None] * 12
+
+    def _recently_edited(self, i: int, now: float) -> bool:
+        return now - self._last_sent.get(f"edit_time_{i}", 0) < EDIT_GUARD_S
+
+    def _note_device_value(self, i: int, m=None, sr=None):
+        """Record a value the device reported, so the send-dedup compares
+        against the device's real state rather than our last send."""
+        if m is not None:
+            self._last_sent[f"m{i}"] = m
+        if sr is not None:
+            self._last_sent[f"sr{i}"] = sr
+
     def set_tss_panel(self, ch: int, t: int, sp: int, sl: int):
         """Update per-card TSS sliders from device state."""
         if ch < len(self.channels):
@@ -3398,12 +3634,12 @@ class ParametersTab(QWidget):
         """Apply full state including TSS panel — skip recently edited channels."""
         now = __import__('time').monotonic()
         for i in range(min(12, len(m))):
-            last_edit = self._last_sent.get(f"edit_time_{i}", 0)
-            if now - last_edit < 3.0:
+            if self._recently_edited(i, now):
                 continue
             card = self.channels[i]
             card.set_manual(m[i] if i < len(m) else 0)
             card.set_operator(sr[i] if i < len(sr) else 0)
+            self._note_device_value(i, m=m[i], sr=sr[i] if i < len(sr) else 0)
             self.set_tss_panel(i,
                 t[i]  if i < len(t)  else 0,
                 sp[i] if i < len(sp) else 0,
@@ -3423,28 +3659,22 @@ class ParametersTab(QWidget):
             self._prev_mod[i] = mod
 
             card = self.channels[i]
-            last_edit = self._last_sent.get(f"edit_time_{i}", 0)
-            recently_edited = now - last_edit < 3.0
+            recently_edited = self._recently_edited(i, now)
             m = mod.get("m", 0)
-            if card._is_toggle:
+            if not recently_edited:
                 card.set_manual(m)
                 s = mod.get("s", 0)
                 if s != card.get_operator():
                     card.set_operator(s)
-                if "o" in mod:
-                    card.set_output(mod["o"])
+                self._note_device_value(i, m=m, sr=s)
             else:
-                o = mod.get("o", m)
-                if not recently_edited:
-                    card.set_manual(m)
-                    s = mod.get("s", 0)
-                    if s != card.get_operator():
-                        card.set_operator(s)
-                # Always update output bar — shows live modulation even during edits
-                card.set_output(o)
+                # Re-check next poll: this reply may predate our edit
+                self._prev_mod[i] = None
+            # Always update output bar — shows live modulation even during edits
+            card.set_output(mod.get("o", m))
 
             # Update TSS from fast poll if present
-            if "t" in mod or "sp" in mod or "sl" in mod:
+            if not recently_edited and ("t" in mod or "sp" in mod or "sl" in mod):
                 t_val  = mod.get("t", 0)
                 sp_val = mod.get("sp", 0)
                 sl_val = mod.get("sl", 0)
@@ -3453,6 +3683,7 @@ class ParametersTab(QWidget):
     def set_transport_state(self, state: str):
         """Update play/stop button styling based on transport state."""
         playing = state.lower() in ("playing", "running", "started")
+        self.transport_playing = playing
         if playing:
             self.start_btn.setStyleSheet(
                 f"QPushButton{{background:#7c3aed;border:2px solid #a855f7;"
@@ -3498,7 +3729,7 @@ class ParametersTab(QWidget):
     def _manual_changed(self, index: int, value: int):
         """Direct send — no timer, deduplicate by tracking last sent value."""
         last = self._last_sent.get(f"m{index}")
-        if last == value:
+        if last == value and not self.channels[index]._is_toggle:
             return
         self._last_sent[f"m{index}"] = value
         self._last_sent[f"edit_time_{index}"] = __import__('time').monotonic()
@@ -3509,7 +3740,7 @@ class ParametersTab(QWidget):
         """Direct send — no timer, deduplicate."""
         key = f"{field}{index}"
         last = self._last_sent.get(key)
-        if last == value:
+        if last == value and field != "sr":
             return
         self._last_sent[key] = value
         self._last_sent[f"edit_time_{index}"] = __import__('time').monotonic()
@@ -3534,8 +3765,8 @@ class ParametersTab(QWidget):
     def _on_bpm_slider(self, val):
         self.bpm_display.setText(f"{val/100:.2f}")
         mw = self.window()
-        if hasattr(mw, "_worker") and mw._worker:
-            mw._worker.send(f"transport bpm {val}")
+        if hasattr(mw, "_queue_cmd") and mw._worker:
+            mw._queue_cmd("bpm", f"transport bpm {val}")
 
     def _transport(self, action: str):
         if action == "tap":
@@ -3728,6 +3959,9 @@ class ConsoleWidget(QWidget):
 
         self.text = QTextEdit()
         self.text.setReadOnly(True)
+        # Cap history — an unbounded QTextEdit slows every append over a
+        # long session.
+        self.text.document().setMaximumBlockCount(2000)
         self.text.setMaximumHeight(60)
         self.text.setMinimumHeight(60)
         self.text.setFixedHeight(60)
@@ -3874,7 +4108,9 @@ class SnapshotManager:
     def open_folder(self):
         """Open the snapshots folder in Finder (macOS)."""
         self._ensure_folder()
-        os.system(f'open "{self.folder}"')
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.folder)))
 
 
 # ── Snapshots tab ──────────────────────────────────────────────────────
@@ -4347,23 +4583,18 @@ class SystemTab(QWidget):
         self.src_combo.setVisible(False)
         vl.addLayout(src_row)
 
-        # Analog connection type (shown when analog selected)
+        # Input signal status. The firmware has no connector-select command
+        # (CVBS vs component), so this row only reports what `video status`
+        # says about the active input.
         self._analog_row = QHBoxLayout()
-        analog_lbl = QLabel("Analog In")
+        analog_lbl = QLabel("Signal")
         analog_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:60px;{self._TRANSPARENT}")
         self._analog_row.addWidget(analog_lbl)
-        self._conn_cvbs_btn  = QPushButton("CVBS / COMPOSITE")
-        self._conn_cvbs_btn.setCheckable(True)
-        self._conn_cvbs_btn.setChecked(True)
-        self._conn_comp_btn  = QPushButton("COMPONENT YPbPr")
-        self._conn_comp_btn.setCheckable(True)
-        for b in [self._conn_cvbs_btn, self._conn_comp_btn]:
-            self._analog_row.addWidget(b, stretch=1)
-        self._conn_cvbs_btn.clicked.connect(lambda: self._set_analog_conn("cvbs"))
-        self._conn_comp_btn.clicked.connect(lambda: self._set_analog_conn("component"))
+        self._signal_lbl = QLabel("\u2014")
+        self._signal_lbl.setStyleSheet(f"color:{TEXT};font-size:18px;{self._TRANSPARENT}")
+        self._analog_row.addWidget(self._signal_lbl, stretch=1)
         self._analog_widget = QWidget()
         self._analog_widget.setLayout(self._analog_row)
-        self._analog_widget.setVisible(False)
         vl.addWidget(self._analog_widget)
 
         # Timing selector
@@ -4451,6 +4682,7 @@ class SystemTab(QWidget):
         self._fw_fields = {}
         for label, key in [
             ("Version",     "version"),
+            ("Latest",      "latest"),
             ("App",         "app"),
             ("Uptime",      "uptime"),
         ]:
@@ -4466,7 +4698,41 @@ class SystemTab(QWidget):
         # App row is static — show the running version always
         self._fw_fields["app"].setText(f"v{APP_VERSION}")
 
+        # Shown only when the device runs older firmware than LZX's newest
+        self.fw_update_btn = QPushButton("UPDATE FIRMWARE WITH LZX CONNECT")
+        self.fw_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fw_update_btn.setStyleSheet(
+            f"QPushButton{{background:{ACCENT2};border:2px solid #ffffff;"
+            f"border-radius:6px;color:#ffffff;font-size:13px;font-weight:bold;"
+            f"letter-spacing:1px;padding:8px 12px;}}"
+            f"QPushButton:hover{{background:{DIM};}}"
+        )
+        self.fw_update_btn.setVisible(False)
+        self.fw_update_btn.clicked.connect(lambda: self._open_doc(LZX_CONNECT_URL))
+        fl.addWidget(self.fw_update_btn)
+        self._device_fw = ""
+        self._latest_fw = ""
+
         rl.addWidget(fw_grp)
+
+        # ·· Device health (cpu / ram / fpga / sd), polled while tab visible ··
+        health_grp = QGroupBox("DEVICE HEALTH")
+        hl = QVBoxLayout(health_grp)
+        hl.setSpacing(6)
+        self._health_fields = {}
+        for label, key in [("CPU", "cpu"), ("Memory", "ram"),
+                           ("FPGA", "fpga"), ("SD Card", "sd")]:
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:18px;min-width:80px;{self._TRANSPARENT}")
+            row.addWidget(lbl)
+            val = QLabel("\u2014")
+            val.setStyleSheet(f"color:{TEXT};font-size:16px;font-weight:bold;{self._TRANSPARENT}")
+            row.addWidget(val, stretch=1)
+            hl.addLayout(row)
+            self._health_fields[key] = val
+        self._cpu = {}
+        rl.addWidget(health_grp)
 
         # ·· Storage (SD card as USB mass storage) ··
         storage_grp = QGroupBox("STORAGE")
@@ -4527,9 +4793,11 @@ class SystemTab(QWidget):
         dl.setSpacing(8)
 
         self._doc_links = [
+            # LZX's official firmware / program-library updater (Mac, Win, Linux)
+            ("LZX Connect — Firmware Updater", "https://lzxindustries.net/connect"),
             ("Community", "https://community.lzxindustries.net/"),
             ("Device Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
-            ("Technical Manual", "https://docs.lzxindustries.net/docs/instruments/videomancer"),
+            ("Technical Manual", "https://lzxindustries.net/instruments/videomancer/manual"),
             ("App Releases", f"https://github.com/{GITHUB_REPO}/releases"),
         ]
         for label, url in self._doc_links:
@@ -4567,13 +4835,15 @@ class SystemTab(QWidget):
         self.src_combo.setEnabled(v)
         self._src_hdmi_btn.setEnabled(v)
         self._src_analog_btn.setEnabled(v)
-        self._conn_cvbs_btn.setEnabled(v)
-        self._conn_comp_btn.setEnabled(v)
         self.timing_combo.setEnabled(v)
         if not v:
+            self._device_fw = ""
+            self.fw_update_btn.setVisible(False)
+            for val in self._health_fields.values():
+                val.setText("\u2014")
             for key, val in self._fw_fields.items():
-                # "app" is static — always show the running app version
-                if key == "app":
+                # "app" and "latest" don't depend on the device
+                if key in ("app", "latest"):
                     continue
                 val.setText("\u2014")
             for val in self._status_fields.values():
@@ -4610,10 +4880,21 @@ class SystemTab(QWidget):
         )
 
         locked = self._is_true(data.get("locked", False))
+        # Per-input detail (rc.5x firmware): lock for the active input,
+        # external sync, and whether an HDMI display is attached.
+        per_input = data.get(src) if isinstance(data.get(src), dict) else {}
+        in_locked = self._is_true(per_input.get("locked", locked))
+        parts = ["LOCKED" if in_locked else "NO SIGNAL"]
+        if self._is_true(data.get("external_vsync", False)):
+            parts.append("EXT SYNC")
+        if "hdmi_connected" in output:
+            parts.append("HDMI OUT " + ("ON" if self._is_true(output["hdmi_connected"]) else "OFF"))
+        self._signal_lbl.setText("  \u00b7  ".join(parts))
+        self._signal_lbl.setStyleSheet(
+            f"color:{TEXT if in_locked else ERROR};font-size:18px;{self._TRANSPARENT}")
         # Sync source toggle buttons
         self._src_hdmi_btn.setChecked(src == "hdmi")
         self._src_analog_btn.setChecked(src == "analog")
-        self._analog_widget.setVisible(src == "analog")
         # Sync hidden combo
         idx = 1 if src == "hdmi" else 0
         self.src_combo.blockSignals(True)
@@ -4638,9 +4919,11 @@ class SystemTab(QWidget):
     def apply_midi_cc(self, assignments: list):
         lines = []
         for i, a in enumerate(assignments):
-            msb = a.get("msb", "?")
-            lsb = a.get("lsb", "?")
-            lines.append(f"P{i+1:02d}  MSB:{msb:3d}  LSB:{lsb:3d}")
+            msb = a.get("msb")
+            lsb = a.get("lsb")
+            msb = f"{msb:3d}" if isinstance(msb, int) else "  -"
+            lsb = f"{lsb:3d}" if isinstance(lsb, int) else "  -"
+            lines.append(f"P{i+1:02d}  MSB:{msb}  LSB:{lsb}")
         self.midi_table.setText("\n".join(lines))
 
     def _set_source(self, src: str):
@@ -4648,7 +4931,6 @@ class SystemTab(QWidget):
         # Update toggle button states
         self._src_hdmi_btn.setChecked(src == "hdmi")
         self._src_analog_btn.setChecked(src == "analog")
-        self._analog_widget.setVisible(src == "analog")
         # Sync hidden combo
         self.src_combo.blockSignals(True)
         self.src_combo.setCurrentIndex(1 if src == "hdmi" else 0)
@@ -4659,13 +4941,6 @@ class SystemTab(QWidget):
         for delay in [500, 1500, 3000, 5000, 8000, 12000]:
             QTimer.singleShot(delay, self._fetch_status)
 
-    def _set_analog_conn(self, conn: str):
-        """Set analog input connector type."""
-        self._conn_cvbs_btn.setChecked(conn == "cvbs")
-        self._conn_comp_btn.setChecked(conn == "component")
-        if self.on_send:
-            self.on_send(f"video input analog")
-
     def _on_src_changed(self, idx):
         src = self.src_combo.currentData()
         if self.on_send:
@@ -4675,6 +4950,55 @@ class SystemTab(QWidget):
         """Populate the firmware info fields. App row is static (set at init)."""
         self._fw_fields["version"].setText(version or "\u2014")
         self._fw_fields["uptime"].setText(uptime or "\u2014")
+        if version:
+            self._device_fw = version
+        self._refresh_fw_compare()
+
+    def set_latest_firmware(self, latest: str):
+        self._latest_fw = latest
+        self._fw_fields["latest"].setText(latest)
+        self._refresh_fw_compare()
+
+    def firmware_outdated(self) -> bool:
+        dev, new = _fw_version_key(self._device_fw), _fw_version_key(self._latest_fw)
+        return bool(dev and new and new > dev)
+
+    def _refresh_fw_compare(self):
+        outdated = self.firmware_outdated()
+        self.fw_update_btn.setVisible(outdated)
+        colour = WARN if outdated else TEXT
+        self._fw_fields["latest"].setStyleSheet(
+            f"color:{colour};font-size:19px;font-weight:bold;{self._TRANSPARENT}")
+        if self._latest_fw and self._device_fw and not outdated:
+            self._fw_fields["latest"].setText(f"{self._latest_fw}  \u2714 up to date")
+
+    def apply_health(self, kind: str, data: dict):
+        f = self._health_fields
+        if kind == "cpu":
+            for core, d in data.items():
+                if isinstance(d, dict) and "usage" in d:
+                    self._cpu[core] = d["usage"]
+            f["cpu"].setText("  ".join(f"{c.replace('core', 'C')} {u}%"
+                                       for c, u in sorted(self._cpu.items())))
+        elif kind == "ram":
+            heap = data.get("heap") or {}
+            if "used" in heap and "total" in heap:
+                f["ram"].setText(f"heap {heap['used']} / {heap['total']} KB")
+        elif kind == "fpga":
+            state = str(data.get("state", "?")).upper()
+            prog = data.get("program", "")
+            f["fpga"].setText(f"{state} \u00b7 {prog}" if prog else state)
+            f["fpga"].setStyleSheet(
+                f"color:{TEXT if data.get('configured', True) else ERROR};"
+                f"font-size:16px;font-weight:bold;{self._TRANSPARENT}")
+        elif kind == "fs":
+            if not data.get("present", True):
+                f["sd"].setText("NO CARD")
+            elif not data.get("mounted", True):
+                f["sd"].setText("NOT MOUNTED")
+            elif "free" in data and "total" in data:
+                gb = 1024 ** 3
+                f["sd"].setText(f"{data['free']/gb:.1f} GB free of {data['total']/gb:.1f} GB")
 
     def _refresh(self):
         self._fetch_status()
@@ -4772,6 +5096,11 @@ class SystemTab(QWidget):
             return
 
         lower = (payload or "").strip().lower()
+        try:
+            active = json.loads(payload).get("active")
+            lower = '"active":true' if active is True else '"active":false' if active is False else lower
+        except Exception:
+            pass
 
         if '"active":true' in lower:
             if self._msd_state == "waiting":
@@ -5151,7 +5480,7 @@ class VideomancerApp(QMainWindow):
             title += f" {self._window_label}"
         self.setWindowTitle(title)
         self.resize(820, 1020)
-        self.setMinimumSize(700, 860)
+        self.setMinimumSize(640, 560)
         self.setStyleSheet(STYLESHEET)
 
         self._worker: Optional[SerialWorker] = None
@@ -5177,6 +5506,22 @@ class VideomancerApp(QMainWindow):
         self._snap_settings: dict = {}
         self._snap_stage:    int  = 0   # 0=idle,1=params,2=presets,3=settings
         self._tss_readback_pending = False
+        self._poll_inflight = {}        # poll cmd → monotonic send time
+        self._pending_cmds = {}         # control key → latest command
+        self._cmd_flush = QTimer(self)  # ~30 Hz coalesced send
+        self._cmd_flush.setSingleShot(True)
+        self._cmd_flush.setInterval(33)
+        self._cmd_flush.timeout.connect(self._flush_cmds)
+        self._taps = []
+        self._user_disconnected = False
+        self._load_watchdog = QTimer(self)
+        self._load_watchdog.setSingleShot(True)
+        self._load_watchdog.setInterval(10000)
+        self._load_watchdog.timeout.connect(
+            lambda: self._abort_pending_load(
+                f"Load failed ({self._pending_load_error})" if self._pending_load_error
+                else "Load timed out — device didn't confirm"))
+        self._pending_load_error = ""
 
         self._setup_ui()
 
@@ -5197,6 +5542,12 @@ class VideomancerApp(QMainWindow):
         QTimer.singleShot(1500, self._hotplug_timer.start)
 
         # Check for app updates in background
+        self._fw_checker = _FirmwareChecker()
+        self._fw_checker.latest_found.connect(self._on_latest_firmware)
+        self._fw_checker.start()
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(5000)
+        self._health_timer.timeout.connect(self._poll_health)
         self._update_checker = _UpdateChecker()
         self._update_checker.update_available.connect(self._on_update_available)
         self._update_checker.start()
@@ -5241,10 +5592,20 @@ class VideomancerApp(QMainWindow):
         self.state_tab   = StateTab()
         self.snap_tab    = SnapshotsTab()   # keep for snapshot callbacks
 
-        self.tabs.addTab(self.prog_tab,   "PROGRAMS")
-        self.tabs.addTab(self.param_tab,  "CONTROL")
-        self.tabs.addTab(self.system_tab, "SYSTEM")
-        self.tabs.addTab(self.state_tab,  "STATE")
+        # Each tab scrolls when the window is smaller than its layout, so the
+        # app fits 768-px-tall laptop screens (Control alone needs ~690 px).
+        def _scrollable(w):
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QFrame.Shape.NoFrame)
+            sa.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+            sa.setWidget(w)
+            return sa
+        self.tabs.addTab(_scrollable(self.prog_tab),   "PROGRAMS")
+        self.tabs.addTab(_scrollable(self.param_tab),  "CONTROL")
+        self.tabs.addTab(_scrollable(self.system_tab), "SYSTEM")
+        self.tabs.addTab(_scrollable(self.state_tab),  "STATE")
+        self._install_shortcuts()
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.conn_bar.data_refresh_btn.clicked.connect(self._on_tab_refresh)
 
@@ -5495,6 +5856,15 @@ class VideomancerApp(QMainWindow):
                 "Documentation section to download manually.",
             )
             return
+        if _is_translocated(current_bundle) or \
+                not os.access(current_bundle.parent, os.W_OK):
+            _VMConfirmDialog.notify(
+                self, "Move to Applications First",
+                "macOS is running this copy from a read-only location, so it "
+                "can't be updated in place. Drag Videomancer Control into your "
+                "Applications folder, relaunch it, then install the update.",
+            )
+            return
 
         from PyQt6.QtWidgets import QProgressDialog
         self._update_progress = QProgressDialog(
@@ -5618,6 +5988,8 @@ fi
         try:
             if self._worker and self._worker.isRunning():
                 return  # already connected
+            if self._user_disconnected:
+                return
             # Skip if a reconnect attempt is pending (avoid double-connect)
             if getattr(self, '_reconnect_attempt', 0) > 0:
                 return
@@ -5638,6 +6010,7 @@ fi
     def _do_connect(self, port: str):
         if self._worker and self._worker.isRunning():
             return
+        self._user_disconnected = False
         # Claim port immediately to prevent other windows from grabbing it
         _claimed_ports.add(port)
         self._claimed_port = port
@@ -5652,6 +6025,8 @@ fi
         self._worker.connect_port(port)
 
     def _do_disconnect(self):
+        # Manual disconnect: stay disconnected until the user clicks Connect
+        self._user_disconnected = True
         if self._worker:
             self._worker.disconnect_port()
 
@@ -5702,7 +6077,9 @@ fi
         self.snap_tab.set_connected(False)
         label = self._window_label
         self.setWindowTitle(f"VIDEOMANCER CONTROL {label}")
-        self.status_bar.showMessage("Disconnected — reconnecting…")
+        self.status_bar.showMessage(
+            "Disconnected" if self._user_disconnected else "Disconnected — reconnecting…")
+        self._abort_pending_load("Disconnected during load")
         # Clear active program and switch to Programs tab (splash screen)
         self._active_program = None
         if hasattr(self, 'conn_bar') and hasattr(self.conn_bar, '_prog_lbl'):
@@ -5727,6 +6104,8 @@ fi
         """Attempt to reconnect to the last known port."""
         if self._worker and self._worker.isRunning():
             return  # already reconnected via hotplug
+        if self._user_disconnected:
+            return
         # Check if port still exists without opening it
         from pathlib import Path
         if not Path(port).exists():
@@ -5779,12 +6158,28 @@ fi
             self.system_tab.apply_msd_response(prefix, payload)
             return
 
+        if prefix == "error" and self._pending_load:
+            # Errors carry a numeric code, not the command that caused them, so
+            # we can't tell a rejected load from a poll that failed while the
+            # FPGA reconfigures. Remember it; the load watchdog reports it if
+            # the load never confirms.
+            self._pending_load_error = f"{key}: {payload}".strip(": ")
+
         if prefix != "ok":
             return
 
         if key == "version":
             self._sb_fw.setText(f"FW: {payload}")
             self.system_tab.apply_firmware_info(version=payload.strip())
+            self._maybe_announce_firmware()
+
+        elif key in ("cpu", "ram", "fpga", "fs"):
+            try:
+                data = json.loads(payload)
+            except Exception:
+                return
+            if isinstance(data, dict):
+                self.system_tab.apply_health(key, data)
 
         elif key == "program":
             if payload == "ok":
@@ -5792,12 +6187,13 @@ fi
                 if self._pending_load:
                     name = self._pending_load
                     self._pending_load = None
-                    self._set_active_program(name)
+                    self._load_watchdog.stop()
+                    self._set_active_program(name, force=True)
                     self.prog_tab.set_loading_program(False)
                     self.status_bar.showMessage(f"Loaded: {name}", 4000)
                     self._trigger_poof()
                     # Fetch state + presets + TSS + info after load
-                    QTimer.singleShot(500, lambda: self._worker.send("program info"))
+                    QTimer.singleShot(500, lambda: self._worker and self._worker.send("program info"))
                     QTimer.singleShot(1500, self._request_state)
                     QTimer.singleShot(1500, self._fetch_presets)
                     QTimer.singleShot(1800, self._fetch_tss_readback_auto)
@@ -5816,13 +6212,11 @@ fi
                     self.console.append("error", "json", f"Bad program payload: {exc}")
                     return
 
-                if "m" in data or "ch" in data:
+                if ("m" in data or "ch" in data) and "n" not in data:
+                    self._poll_inflight.pop("program state", None)
                     # program state — RC11 uses "m", older docs said "ch"
                     m  = data.get("m",  data.get("ch", []))
                     sr = data.get("sr", [0]*12)
-                    # Log raw keys so we can verify firmware sends TSS
-                    self.console.append("ok", "program-state-keys",
-                                        str(list(data.keys())))
                     # Only apply TSS if the response actually includes them
                     # (avoid resetting to 512 from responses that omit TSS)
                     has_tss = "t" in data or "sp" in data or "sl" in data
@@ -5835,8 +6229,7 @@ fi
                         # Apply only manual + operator, skip recently edited
                         now = __import__('time').monotonic()
                         for i in range(min(12, len(m))):
-                            last_edit = self.param_tab._last_sent.get(f"edit_time_{i}", 0)
-                            if now - last_edit < 3.0:
+                            if self.param_tab._recently_edited(i, now):
                                 continue
                             card = self.param_tab.channels[i]
                             card.set_manual(m[i] if i < len(m) else 0)
@@ -5881,6 +6274,21 @@ fi
                 elif "parameters" in data and "id" in data:
                     # program info response — apply parameter names to UI
                     params = data.get("parameters", [])
+                    running = data.get("name", "")
+                    if running and self._active_program and running != self._active_program:
+                        # The device answers `program load X` with @program:ok
+                        # even when X fails to load and the previous program
+                        # keeps running (seen with Bleach on rc.55). `program
+                        # info` is a direct query, so it wins over our guess.
+                        wanted = self._active_program
+                        self.console.append("error", "load",
+                            f"Device is running {running!r}, not {wanted!r}")
+                        self.status_bar.showMessage(
+                            f"\u26a0 Couldn't load {wanted} — the Videomancer is still "
+                            f"running {running}. The program file may be damaged or "
+                            f"incompatible; try reinstalling it with LZX Connect.", 12000)
+                        self._set_active_program(running, force=True)
+                        return   # force=True re-requests info for the real program
                     self.console.append("ok", "program-info", str(data))
                     self.param_tab.apply_param_labels(params)
                     # Show description in Programs tab if available
@@ -5907,12 +6315,15 @@ fi
                     self._sb_vid.setText("Video: parse error")
 
         elif key == "modulation":
+            if payload.strip() == "ok":
+                return  # ack for `modulation set/source`
             try:
                 data = json.loads(payload)
             except Exception as exc:
                 self.console.append("error", "json", f"Bad modulation payload: {exc}")
                 return
             if "modulators" in data:
+                self._poll_inflight.pop("modulation status", None)
                 mods = data["modulators"]
                 # Auto-switch to Motion tab when a physical knob is touched
                 active = data.get("active", -1)
@@ -6042,11 +6453,23 @@ fi
                                     "Connect to Videomancer first.")
             return
         self._pending_load = name
-        self.param_tab._last_sent.clear()  # reset dedup on program change
+        self.param_tab.reset_sync_caches()  # reset dedup on program change
+        self._poll_inflight.clear()
         self.prog_tab.set_loading_program(True)
         self.status_bar.showMessage(f"Loading {name}…")
         self.console.append("cmd", f"program load {name}", "")
+        self._pending_load_error = ""
         self._worker.load_program(name)
+        self._load_watchdog.start()
+
+    def _abort_pending_load(self, msg: str):
+        if not self._pending_load:
+            return
+        self._pending_load = None
+        self._load_watchdog.stop()
+        self.prog_tab.set_loading_program(False)
+        self.status_bar.showMessage(msg, 6000)
+        self.console.append("error", "load", msg)
 
     def _trigger_poof(self):
         """Fire the poof + sparkle animation centered on the RUNNING pill."""
@@ -6068,14 +6491,17 @@ fi
         self._poof.trigger(cx, cy)
         self._sparkle.trigger(cx, cy)
 
-    def _set_active_program(self, name: str):
-        if name != self._active_program:
-            self.console.append("log", "", f"[active] {self._active_program!r} → {name!r}")
-        self._active_program = name
+    def _set_active_program(self, name: str, force: bool = False):
         # Lock window: keep status polls from reverting this for 15 seconds.
         # Polls that match `name` pass through and reset the lock; polls
         # reporting a different program are ignored until the device catches up.
         self._active_program_lock_until = time.monotonic() + 15.0
+        if name == self._active_program and not force:
+            # Routine status poll confirming what we already show — don't
+            # re-fetch program info, rebuild lists or clear status text.
+            return
+        self.console.append("log", "", f"[active] {self._active_program!r} → {name!r}")
+        self._active_program = name
         self.prog_tab.set_active(name)
         self.param_tab.set_program(name)
         self.state_tab.set_snapshot_status("")
@@ -6083,7 +6509,7 @@ fi
         # Show active program in window title
         if name:
             port = self.conn_bar.port_combo.currentText()
-            self.setWindowTitle(f"VIDEOMANCER CONTROL — {name}  [{port}]")
+            self.setWindowTitle(f"VIDEOMANCER CONTROL {self._window_label} — {name}  [{port}]")
         else:
             self.setWindowTitle("VIDEOMANCER CONTROL")
         if hasattr(self, '_header_prog'):
@@ -6112,8 +6538,10 @@ fi
         try:
             if not self._worker:
                 return
-            if not self._user_editing:
-                self._worker.send("modulation status")
+            # Keep polling modulation status while the user edits: readback
+            # is filtered per channel, so other knobs (and hardware moves)
+            # stay live.
+            self._poll_once("modulation status")
             if not hasattr(self, '_poll_count'):
                 self._poll_count = 0
             self._poll_count += 1
@@ -6123,13 +6551,40 @@ fi
                 # Poll every tick so TSS knobs (carried in `program state`)
                 # update at the same cadence as the main knobs in
                 # `modulation status` — keeps their glide visually matched.
-                self._worker.send("program state")
+                self._poll_once("program state")
             if self._poll_count % 20 == 0:
                 self._worker.send("video status")
             if self._poll_count % 8 == 0:
                 self._worker.send("status")
         except Exception:
             pass
+
+    def _poll_once(self, cmd: str):
+        """Send a poll only if the previous one has been answered (or has
+        been outstanding > 1 s), so a slow device doesn't get a backlog of
+        queries in front of the user's own commands."""
+        now = time.monotonic()
+        sent = self._poll_inflight.get(cmd)
+        if sent is not None and now - sent < 1.0:
+            return
+        self._poll_inflight[cmd] = now
+        self._worker.send(cmd)
+
+    def _queue_cmd(self, key: str, cmd: str):
+        """Coalesce rapid-fire commands (knob drags, BPM fader) so only the
+        latest value per control goes out, ~30 times a second. Dragging a
+        knob used to send one command per pixel of movement."""
+        self._pending_cmds[key] = cmd
+        if not self._cmd_flush.isActive():
+            self._cmd_flush.start()
+
+    def _flush_cmds(self):
+        if not self._worker:
+            self._pending_cmds.clear()
+            return
+        cmds, self._pending_cmds = self._pending_cmds, {}
+        for cmd in cmds.values():
+            self._worker.send(cmd)
 
     def _request_state(self):
         if self._worker and not self._user_editing:
@@ -6145,8 +6600,11 @@ fi
         self._user_editing = True
         self._edit_cooldown.start(300 if is_toggle else 700)
         cmd = f"modulation set {index} {value}"
-        self.console.append("cmd", f"P{index+1} manual → {value}", "")
-        self._worker.send(cmd)
+        if is_toggle:
+            self.console.append("cmd", f"P{index+1} manual → {value}", "")
+            self._worker.send(cmd)
+        else:
+            self._queue_cmd(f"m{index}", cmd)
 
     def _send_mod(self, index: int, field: str, value: int):
         """Send modulation field — operator via modulation source, TSS via preset."""
@@ -6161,14 +6619,12 @@ fi
         else:
             # RC11: modulation set <ch> <val> <field> — confirmed working
             cmd = f"modulation set {index} {value} {field}"
-            self.console.append("cmd", f"P{index+1} {field} → {value}", "")
-            self._worker.send(cmd)
+            self._queue_cmd(f"{field}{index}", cmd)
 
     def _fetch_tss_readback(self):
-        """Read back preset slot 0 to sync TSS sliders from device."""
-        if self._worker:
-            self._tss_readback_pending = True
-            self._worker.send("program presets get 0 user")
+        """Resync TSS from live state. (Used to read preset slot 0, which
+        could overwrite the controls with stale preset values.)"""
+        self._fetch_tss_readback_auto()
 
     def _fetch_tss_readback_auto(self):
         """Fetch full program state to sync TSS sliders from device."""
@@ -6179,18 +6635,36 @@ fi
         if not self._worker:
             return
         cmd_map = {
-            "start": "transport start",
+            # Firmware (rc.5x `help`, LZX serial guide) has play/stop/bpm —
+            # there is no `transport start` or `transport tap`.
+            "start": "transport play",
             "stop":  "transport stop",
-            "tap":   "transport tap",
         }
+        if action == "tap":
+            bpm_x100 = self._tap_tempo()
+            if bpm_x100:
+                self.param_tab.set_bpm(bpm_x100 / 100.0, bpm_x100)
+                self._worker.send(f"transport bpm {bpm_x100}")
+                self.console.append("cmd", f"tap → {bpm_x100/100:.2f} BPM", "")
+            return
         cmd = cmd_map.get(action)
         if cmd:
             self.console.append("cmd", cmd, "")
-            if action == "tap":
-                # Tap needs minimal latency — bypass queue
-                self._worker.send_immediate(cmd)
-            else:
-                self._worker.send(cmd)
+            self._worker.send(cmd)
+
+    def _tap_tempo(self) -> Optional[int]:
+        """Average the last few tap intervals into BPM×100. Taps more than
+        2 s apart start a new count. Returns None until two taps."""
+        now = time.monotonic()
+        taps = self._taps
+        if taps and now - taps[-1] > 2.0:
+            taps = []
+        taps = (taps + [now])[-5:]
+        self._taps = taps
+        if len(taps) < 2:
+            return None
+        avg = (taps[-1] - taps[0]) / (len(taps) - 1)
+        return max(2000, min(30000, round(6000 / avg)))
 
     # ------------------------------------------------------------------
     # Presets
@@ -6229,7 +6703,7 @@ fi
             sp_str = ",".join(sp_vals)
             sl_str = ",".join(sl_vals)
             sr_str = ",".join(sr_vals)
-            cmd = (f"program presets save {index} {name} "
+            cmd = (f"program presets save {index} {_cmd_safe_name(name)} "
                    f"m:{m_str} t:{t_str} sp:{sp_str} sl:{sl_str} sr:{sr_str}")
             self.console.append("cmd", cmd, "")
             self._worker.send(cmd)
@@ -6243,7 +6717,7 @@ fi
 
     def _rename_preset(self, index: int, name: str):
         if self._worker:
-            cmd = f"program presets rename {index} {name}"
+            cmd = f"program presets rename {index} {_cmd_safe_name(name)}"
             self.console.append("cmd", cmd, "")
             self._worker.send(cmd)
             QTimer.singleShot(500, self._fetch_presets)
@@ -6280,45 +6754,48 @@ fi
         self.state_tab.set_snapshot_status(f"Restoring: loading {program}…")
 
         def _abort_restore(msg="Restore aborted — device disconnected"):
+            self._suppress_poof = False
             self.state_tab.set_snapshot_status(msg)
             self.state_tab._restore_btn.setEnabled(True)
 
         def step2():
+            """Write the live values straight to the running program.
+            (This used to save them into user preset slot 0 as "live" and
+            apply it, silently overwriting the user's first saved State.)"""
             if not self._worker:
                 return _abort_restore()
             if parameters:
-                m_str  = ",".join(str(v) for v in parameters)
-                t_list  = data.get("t",  [0]*12)
-                sp_list = data.get("sp", [0]*12)
-                sl_list = data.get("sl", [0]*12)
-                sr_list = data.get("sr", [0]*12)
-                t_str  = ",".join(str(v) for v in t_list)
-                sp_str = ",".join(str(v) for v in sp_list)
-                sl_str = ",".join(str(v) for v in sl_list)
-                sr_str = ",".join(str(v) for v in sr_list)
-                self._worker.send(
-                    f"program presets save 0 live "
-                    f"m:{m_str} t:{t_str} sp:{sp_str} sl:{sl_str} sr:{sr_str}"
-                )
-                self._worker.send("program presets apply 0 user")
-                self.param_tab.apply_state(
-                    parameters, t_list, sp_list, sl_list, sr_list
-                )
+                n = min(12, len(parameters))
+                t_list  = list(data.get("t",  [512] * 12))
+                sp_list = list(data.get("sp", [512] * 12))
+                sl_list = list(data.get("sl", [512] * 12))
+                sr_list = list(data.get("sr", [0] * 12))
+                now = time.monotonic()
+                for i in range(n):
+                    card = self.param_tab.channels[i]
+                    m = int(parameters[i])
+                    if card._is_toggle:
+                        m = PARAM_RANGE if m > 0 else 0   # device reports 0/1
+                    self._worker.send(f"modulation source {i} {int(sr_list[i])}")
+                    self._worker.send(f"modulation set {i} {m}")
+                    for field, vals in (("t", t_list), ("sp", sp_list), ("sl", sl_list)):
+                        if i < len(vals):
+                            self._worker.send(f"modulation set {i} {int(vals[i])} {field}")
+                    # keep in-flight polls from snapping the UI back
+                    self.param_tab._last_sent[f"edit_time_{i}"] = now
+                self.param_tab.apply_state(parameters, t_list, sp_list, sl_list, sr_list)
             self.state_tab.set_snapshot_status("Restoring presets…")
             QTimer.singleShot(400, step3)
 
         def step3():
             if not self._worker:
                 return _abort_restore()
-            user = presets.get("user", [])
-            for i, p in enumerate(user):
-                name  = p.get("n", f"preset_{i}")
-                m     = p.get("m", [])
-                if m:
-                    m_str = ",".join(str(v) for v in m)
-                    self._worker.send(
-                        f"program presets save {i} {name} m:{m_str}"
-                    )
+            for i, p in enumerate(presets.get("user", [])):
+                name = _cmd_safe_name(p.get("n", f"preset_{i}"), f"preset_{i}")
+                fields = [f"{k}:{','.join(str(v) for v in p[k])}"
+                          for k in ("m", "t", "sp", "sl", "sr") if p.get(k)]
+                if fields:
+                    self._worker.send(f"program presets save {i} {name} {' '.join(fields)}")
             self.state_tab.set_snapshot_status("Restoring settings…")
             QTimer.singleShot(600, step4)
 
@@ -6336,28 +6813,26 @@ fi
             self.state_tab._restore_btn.setEnabled(True)
             self.status_bar.showMessage("Snapshot restored", 4000)
             QTimer.singleShot(4000, lambda: self.state_tab.set_snapshot_status(""))
-            # Belt-and-suspenders: ensure the Programs tab reflects the snapshot's
-            # program even if the @program:ok ack didn't land.
-            if program:
-                self._set_active_program(program)
-            # Leave _pending_load set — it gets cleared in _on_status_update
-            # once the device confirms `current_program` matches. That keeps
-            # stale status replies from reverting the UI indefinitely.
             if self._worker:
                 self._fetch_presets()
-            # Re-enable the load animation for future manual program loads.
             self._suppress_poof = False
 
-        # Load program first, then chain the rest
-        if program:
+        def wait_for_load(deadline):
+            """Chain on the device confirming the load instead of a fixed
+            delay, so values never land in the previous program."""
+            if not self._worker:
+                return _abort_restore()
+            if self._pending_load is None and self._active_program == program:
+                QTimer.singleShot(300, step2)   # let the FPGA settle
+            elif self._pending_load is None or time.monotonic() > deadline:
+                _abort_restore(f"Restore aborted — {program} didn't load")
+            else:
+                QTimer.singleShot(100, lambda: wait_for_load(deadline))
+
+        if program and program != self._active_program:
             self._suppress_poof = True   # no spell animation during restore
-            self._pending_load = program
-            self._worker.load_program(program)
-            # Optimistically update the active-program UI immediately so the
-            # Programs tab reflects the snapshot target. Status polls racing
-            # with a slow device switch won't revert it — see _on_status_update.
-            self._set_active_program(program)
-            QTimer.singleShot(2200, step2)
+            self.load_program(program)
+            wait_for_load(time.monotonic() + 12.0)
         else:
             step2()
 
@@ -6371,7 +6846,66 @@ fi
     # Tab change — lazy-load data
     # ------------------------------------------------------------------
 
+    def _install_shortcuts(self):
+        """Keyboard control. Single-key shortcuts are ignored while typing in
+        a text field (program filter, preset names)."""
+        from PyQt6.QtGui import QShortcut, QKeySequence
+
+        def guarded(fn):
+            def run():
+                from PyQt6.QtWidgets import QAbstractItemView, QAbstractSpinBox
+                if isinstance(QApplication.focusWidget(),
+                              (QLineEdit, QTextEdit, QAbstractItemView, QAbstractSpinBox)):
+                    return
+                fn()
+            return run
+
+        def toggle_play():
+            if self._worker:
+                playing = getattr(self.param_tab, "transport_playing", False)
+                self._send_transport("stop" if playing else "start")
+
+        bindings = [
+            ("Space", guarded(toggle_play)),
+            ("T", guarded(lambda: self._worker and self.param_tab._transport("tap"))),
+            ("Ctrl+R", self._on_tab_refresh),
+            ("R", guarded(lambda: self._worker and self.param_tab.randomize())),
+            ("Ctrl+Z", guarded(lambda: self._worker and self.param_tab.undo())),
+            ("Ctrl+F", lambda: (self.tabs.setCurrentIndex(0),
+                                self.prog_tab.search.setFocus(),
+                                self.prog_tab.search.selectAll())),
+        ]
+        for i in range(self.tabs.count()):
+            bindings.append((f"Ctrl+{i+1}", lambda i=i: self.tabs.setCurrentIndex(i)))
+        self._shortcuts = []
+        for keys, fn in bindings:
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(fn)
+            self._shortcuts.append(sc)
+
+    def _on_latest_firmware(self, latest: str):
+        self.system_tab.set_latest_firmware(latest)
+        self._maybe_announce_firmware()
+
+    def _maybe_announce_firmware(self):
+        """One status-bar nudge per session when the device firmware is behind."""
+        if self.system_tab.firmware_outdated() and not getattr(self, "_fw_announced", False):
+            self._fw_announced = True
+            self.status_bar.showMessage(
+                f"Firmware {self.system_tab._latest_fw} is available — "
+                f"System tab \u2192 Update with LZX Connect", 10000)
+
+    def _poll_health(self):
+        if self._worker and self.tabs.currentIndex() == 2:
+            for cmd in ("cpu", "ram", "fpga status", "fs info"):
+                self._worker.send(cmd)
+        else:
+            self._health_timer.stop()
+
     def _on_tab_changed(self, idx: int):
+        if idx != 2:
+            self._health_timer.stop()
         if not self._worker:
             return
         if idx == 1:   # Motion
@@ -6381,6 +6915,8 @@ fi
             self._worker.send("video status")
             self._worker.send("modulation cc-map")
             self._worker.send("version")
+            self._poll_health()
+            self._health_timer.start()
         elif idx == 3: # State
             self._fetch_presets()
             self.state_tab._reload_snapshots()
@@ -6416,15 +6952,20 @@ fi
             self._hotplug_timer.stop()
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
-        if hasattr(self, '_update_checker') and self._update_checker.isRunning():
-            self._update_checker.quit()
+        self._health_timer.stop()
+        self._load_watchdog.stop()
+        self._cmd_flush.stop()
+        for t in (getattr(self, '_update_checker', None), getattr(self, '_fw_checker', None)):
+            if t is not None and t.isRunning():
+                t.wait(1500)   # network threads finish within their timeout
         if self._monitor_window is not None:
             self._monitor_window.close()
             self._monitor_window = None
         if self._worker:
             self._worker.disconnect_port()
-            # Non-blocking — let thread clean up on its own
-            self._worker.quit()
+            # run() has no event loop, so quit() is a no-op — wait for the
+            # loop to see _running=False and close the port.
+            self._worker.wait(1500)
         # Release claimed port and remove from global window list
         if self._claimed_port:
             _claimed_ports.discard(self._claimed_port)
@@ -6454,6 +6995,13 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
     import traceback
     traceback.print_exception(exc_type, exc_value, exc_tb)
 
+def _is_translocated(bundle: Path) -> bool:
+    """True when macOS Gatekeeper is running this bundle from a read-only
+    AppTranslocation mount (quarantined app launched from where it was
+    downloaded). In-place updates can't work from there."""
+    return "/AppTranslocation/" in str(bundle)
+
+
 def _offer_move_to_applications():
     """If launched from Downloads or Desktop, offer to move the .app bundle
     into /Applications so menu/dock/Spotlight behave the way users expect.
@@ -6467,8 +7015,11 @@ def _offer_move_to_applications():
         return  # running from source, not a .app bundle
     parent = str(bundle.parent.resolve())
     home = str(Path.home().resolve())
-    # Only nag if the bundle is in a transient-looking spot
-    if parent not in (f"{home}/Downloads", f"{home}/Desktop"):
+    # Only nag if the bundle is in a transient-looking spot. A quarantined app
+    # opened from Downloads runs from a read-only AppTranslocation copy, so its
+    # parent is a random /private/var/folders path rather than ~/Downloads.
+    if not _is_translocated(bundle) and \
+            parent not in (f"{home}/Downloads", f"{home}/Desktop"):
         return
     target = Path("/Applications") / bundle.name
     if target.exists():

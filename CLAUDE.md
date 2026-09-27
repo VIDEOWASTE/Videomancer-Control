@@ -8,7 +8,7 @@ The end-user-facing doc is `README.md` — keep user install / usage instruction
 
 ## Two unrelated projects share this directory
 
-1. **Videomancer Control** — everything at the root. Python 3.10+/PyQt6 desktop companion app for LZX Industries' Videomancer hardware. Ships as a signed+notarized macOS `.app` and Windows `.exe`. Current version: **2.5** (see `APP_VERSION` in `main.py`).
+1. **Videomancer Control** — everything at the root. Python 3.10+/PyQt6 desktop companion app for LZX Industries' Videomancer hardware. Ships as a signed+notarized macOS `.app` and Windows `.exe`. Current version: **2.6** (see `APP_VERSION` in `main.py`).
 2. **FairWaste/** — self-contained Swift/Metal iOS+macOS project (camera-input real-time frame store). No code dependency on Videomancer; they just share a parent folder.
 
 ---
@@ -17,13 +17,14 @@ The end-user-facing doc is `README.md` — keep user install / usage instruction
 
 | File | Purpose |
 |------|---------|
-| `main.py` (~5.7k lines) | Entire GUI. Tabs: Programs, Parameters (12-channel), Presets, Snapshots, System. Bump `APP_VERSION` here on release. |
+| `main.py` (~7.1k lines) | Entire GUI. Visible tabs: PROGRAMS, CONTROL (12-channel), SYSTEM, STATE (device presets + local snapshots). `PresetsTab`/`SnapshotsTab` are hidden legacy classes kept for callbacks; `MonitorWindow`/DeckLink capture is unreachable dead code. Bump `APP_VERSION` here on release. |
 | `serial_worker.py` | `SerialWorker(QThread)` — owns the pyserial connection, queues commands, parses responses, emits Qt signals (`connected`, `response`, `status_update`, `programs_page`, …). |
 | `setup.py` | py2app config for the macOS build. Also carries `CFBundleVersion` / `CFBundleShortVersionString` — keep in sync with `APP_VERSION`. |
 | `Videomancer Control.spec`, `VideomancerControl.spec` | PyInstaller specs (macOS + Windows). |
 | `BUILD.sh` / `BUILD_WIN.bat` | Local build scripts (PyInstaller-based). |
 | `entitlements.plist` | Hardened-runtime entitlements for Apple notarization (USB + network client). |
-| `.github/workflows/build-release.yml` | CI: builds, code-signs (Apple), notarizes, publishes a GitHub release on tag push. |
+| `.github/workflows/build-release.yml` | CI: builds a universal2 macOS app (DMG + updater zips) and Windows, code-signs (Apple), notarizes, publishes a GitHub release on tag push. |
+| `scripts/fuse_qt_universal.py` | lipo-merges the other-arch PyQt6-Qt6 wheel into the installed one. PyQt6-Qt6 ships per-arch wheels (everything else is universal2), which is why a plain `--target-architecture universal2` build crashes on Intel. Run before PyInstaller. |
 | `fonts/` | Embedded fonts (`goldplay-semibold.ttf`, `ReliefSingleLine-Regular.ttf`). Referenced by `setup.py` DATA_FILES and loaded at runtime in `main.py`. |
 | `icon.icns`, `icon.ico`, `icon.iconset/` | App icons (macOS, Windows, source). |
 
@@ -36,6 +37,12 @@ Serial over USB (`/dev/cu.usbmodem*` on macOS). Host sends newline-terminated AS
 - any other line — free-form log
 
 Common commands: `version`, `status`, `programs list [offset]`, `program load <name>`, `modulation status`, `transport status`, `video status`. `SerialWorker._dispatch` is the canonical parser.
+
+Protocol gotchas (verified on firmware 1.0.0-rc.55):
+- The reply key is the command's first word, so `program state`/`info`/`presets list` all come back as `@program:` and are told apart by JSON keys. Error keys are numeric codes (`0x58000000 | n`), so an error can't be tied to the command that caused it.
+- Transport is `transport play|stop|bpm <x100>` — there is no `start` or `tap` (tap tempo is computed in the app).
+- `program state` reports toggles as 0/1; the app sends 1023 for ON.
+- Knob drags go through `_queue_cmd` (~30 Hz coalescing); polls through `_poll_once` (one in flight); device readback for a channel is ignored for `EDIT_GUARD_S` after a local edit.
 
 ## Videomancer — release flow
 

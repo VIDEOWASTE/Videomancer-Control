@@ -6,6 +6,7 @@ Runs in a QThread so the UI stays responsive.
 
 import json
 import re
+import threading
 import time
 from PyQt6.QtCore import QThread, pyqtSignal, QMutex
 
@@ -28,6 +29,9 @@ class SerialWorker(QThread):
         self._mutex     = QMutex()
         self._cmd_queue = []
         self._buf       = b""   # partial line buffer
+        # send_immediate() writes from the GUI thread while run() writes from
+        # the worker thread; serialise them so two commands never interleave.
+        self._write_lock = threading.Lock()
 
     def connect_port(self, port: str):
         self._port = port
@@ -166,8 +170,9 @@ class SerialWorker(QThread):
         if not self._running:
             return
         try:
-            self._serial.write(text.encode("ascii"))
-            self._serial.flush()
+            with self._write_lock:
+                self._serial.write(text.encode("ascii"))
+                self._serial.flush()
             self._write_errors = 0
         except Exception as exc:
             if not hasattr(self, '_write_errors'):
