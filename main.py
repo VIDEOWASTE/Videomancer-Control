@@ -5088,7 +5088,8 @@ class SystemTab(QWidget):
         self.osc_port.setValue(_app_settings().value("osc/port", 9000, type=int))
         self.osc_port.setFixedWidth(90)
         self.osc_port.editingFinished.connect(
-            lambda: self.osc_btn.isChecked() and self._osc_changed())
+            lambda: self.osc_btn.isChecked() and self.osc_port.value() != _OSC["port"]
+            and self._osc_changed())
         orow.addWidget(self.osc_port)
         self.osc_status = QLabel("Off")
         self.osc_status.setStyleSheet(VAL)
@@ -5286,7 +5287,7 @@ class SystemTab(QWidget):
 
     def set_osc_state(self, listening: bool, port: int, error: str, last: str):
         self.osc_btn.blockSignals(True)
-        self.osc_btn.setChecked(listening or bool(error))
+        self.osc_btn.setChecked(listening)
         self.osc_btn.blockSignals(False)
         self.osc_btn.setText("ON" if listening else "OFF")
         if error:
@@ -5298,7 +5299,7 @@ class SystemTab(QWidget):
                                       f"{self._TRANSPARENT}")
         if listening:
             self.osc_port.setValue(port)
-            self.osc_status.setText(f"Listening on {_local_ip()}:{port}"
+            self.osc_status.setText(f"Listening on {_OSC['ip'] or _local_ip()}:{port}"
                                     + (f"   \u00b7   last: {last}" if last else ""))
         else:
             self.osc_status.setText("Off \u2014 turn on to control the app over OSC")
@@ -8229,12 +8230,19 @@ fi
         a = a[len(OSC_PREFIX):]
         val = args[0] if args else None
         num = float(val) if isinstance(val, (int, float)) else None
+        if num is not None and not math.isfinite(num):
+            return                                  # NaN / inf from a broken patch
         released = num is not None and num == 0
         pt = self.param_tab
         if a == "/bpm" and num is not None:
             bpm = max(20.0, min(300.0, num))
             x100 = round(bpm * 100)
-            pt.set_bpm(bpm, x100)
+            # Update the display quietly (set_bpm flashes TAP for device-side
+            # tempo changes, which would strobe during an OSC tempo sweep).
+            pt.bpm_display.setText(f"{bpm:.2f}")
+            pt.bpm_slider.blockSignals(True)
+            pt.bpm_slider.setValue(x100)
+            pt.bpm_slider.blockSignals(False)
             self._queue_cmd("bpm", f"transport bpm {x100}")
         elif a in ("/play", "/start") and not released:
             self._send_transport("start")
@@ -8260,7 +8268,9 @@ fi
         elif a in ("/program/next", "/program/prev") and not released:
             names = self.prog_tab._all
             if names:
-                i = names.index(self._active_program) if self._active_program in names else -1
+                # Step from a load still in flight, so quick presses advance.
+                cur = self._pending_load or self._active_program
+                i = names.index(cur) if cur in names else -1
                 i = (i + (1 if a.endswith("next") else -1)) % len(names)
                 self.load_program(names[i])
         elif a == "/randomize" and not released:
@@ -8382,14 +8392,17 @@ fi
 OSC_PREFIX = "/videomancer"
 OSC_HELP = ("/videomancer/bpm 120  \u00b7  /play  \u00b7  /stop  \u00b7  /tap  \u00b7  "
             "/param/1\u201312 0.0\u20131.0  \u00b7  /program \"Name\"  \u00b7  /program/next  "
-            "\u00b7  /program/prev  \u00b7  /randomize  \u00b7  /undo")
+            "\u00b7  /program/prev  \u00b7  /randomize  \u00b7  /undo\n"
+            "While OSC is on, any device on your network can send these \u2014 "
+            "turn it off on shared networks.")
 
 
 class _OscBridge(QObject):
     message = pyqtSignal(str, list)
 
 
-_OSC = {"server": None, "bridge": None, "port": 0, "error": "", "last": ""}
+_OSC = {"server": None, "bridge": None, "port": 0, "error": "", "last": "", "ip": "",
+        "ui_timer": None}
 
 
 def _local_ip() -> str:
@@ -8426,7 +8439,7 @@ def _osc_start(port: int) -> str:
         _OSC["error"] = f"port {port} unavailable ({exc.strerror or exc})"
         return _OSC["error"]
     threading.Thread(target=srv.serve_forever, daemon=True, name="osc").start()
-    _OSC.update(server=srv, port=int(port), error="")
+    _OSC.update(server=srv, port=int(port), error="", ip=_local_ip())
     return ""
 
 
@@ -8447,7 +8460,15 @@ def _osc_dispatch(addr: str, args: list):
         (_app_windows[0] if _app_windows else None)
     if target is not None:
         target._on_osc(addr, args)
-    _osc_refresh_ui()
+    # Faders can send 60+ messages/s — refresh the status line at most 5×/s.
+    if _OSC["ui_timer"] is None:
+        t = QTimer()
+        t.setSingleShot(True)
+        t.setInterval(200)
+        t.timeout.connect(_osc_refresh_ui)
+        _OSC["ui_timer"] = t
+    if not _OSC["ui_timer"].isActive():
+        _OSC["ui_timer"].start()
 
 
 def _osc_refresh_ui():
