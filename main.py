@@ -423,6 +423,42 @@ TEXT     = "#ffffff"   # near-white
 TEXT_DIM = "#d8cfee"   # muted purple-grey
 ERROR    = "#ff4466"
 WARN     = "#e0d0ff"
+HILITE        = "#7c3aed"   # lit toggles / active buttons
+HILITE_BORDER = "#a855f7"
+TRACK_BG      = "#0d0b1e"   # empty fader track
+BAR_BG        = "#1a1433"   # modulation bar background
+GRIP          = "#9988cc"   # fader grip lines
+SEL_BG        = "#2d1f5e"   # update banner
+SEL_BG2       = "#3d2f7e"
+SEL_TEXT      = "#a78bfa"
+SPARKLE       = "#ff66ff"
+
+# Selectable colour themes (System tab). "purple" is the original look;
+# "amber" follows the orange/cream-on-black Videomancer shirt art.
+THEMES = {
+    "purple": dict(BG="#0f0d1f", SURFACE="#1e1a38", SURFACE2="#2d2650", BORDER="#9955cc",
+                   ACCENT="#ffffff", ACCENT2="#c040c0", DIM="#7733bb", TEXT="#ffffff",
+                   TEXT_DIM="#d8cfee", ERROR="#ff4466", WARN="#e0d0ff",
+                   HILITE="#7c3aed", HILITE_BORDER="#a855f7", TRACK_BG="#0d0b1e",
+                   BAR_BG="#1a1433", GRIP="#9988cc", SEL_BG="#2d1f5e", SEL_BG2="#3d2f7e",
+                   SEL_TEXT="#a78bfa", SPARKLE="#ff66ff"),
+    "amber":  dict(BG="#14120e", SURFACE="#211d17", SURFACE2="#2f2a22", BORDER="#d9822b",
+                   ACCENT="#fff4dc", ACCENT2="#f0922e", DIM="#a8581a", TEXT="#f7ecd2",
+                   TEXT_DIM="#cdbb98", ERROR="#ff5a3c", WARN="#ffd9a0",
+                   HILITE="#d97414", HILITE_BORDER="#ffb057", TRACK_BG="#0c0a07",
+                   BAR_BG="#1b1813", GRIP="#c8a878", SEL_BG="#3a2a14", SEL_BG2="#4d3818",
+                   SEL_TEXT="#ffb057", SPARKLE="#ffd27a"),
+}
+THEME = "purple"
+
+
+def _apply_theme(name: str):
+    """Swap the module-level colour names (widgets read them when they're
+    built, painted widgets on every paint) and rebuild the app stylesheet."""
+    global THEME, STYLESHEET
+    THEME = name if name in THEMES else "purple"
+    globals().update(THEMES[THEME])
+    STYLESHEET = _build_stylesheet()
 
 PARAM_RANGE = 1023   # 0–1023, centre = 512
 
@@ -1049,7 +1085,8 @@ class MonitorWindow(QWidget):
         event.accept()
 
 
-STYLESHEET = f"""
+def _build_stylesheet() -> str:
+    return f"""
 QMainWindow, QWidget {{
     background: {BG};
     color: {TEXT};
@@ -1195,20 +1232,24 @@ QDialog {{ background: {SURFACE}; color: {TEXT}; }}
 """
 
 
+STYLESHEET = _build_stylesheet()
+
+
+
 # ── Shared helpers ─────────────────────────────────────────────────────
 
 def pill(text, color=None):
     c = color or ACCENT2
     lbl = QLabel(text)
-    if c == "#c040c0":
-        # OFFLINE pill: solid purple bg, white border + text
-        lbl.setStyleSheet("""
-            QLabel {
-                background: #7c3aed; border: 2px solid #ffffff;
+    if c == ACCENT2:
+        # OFFLINE pill: solid highlight bg, white border + text
+        lbl.setStyleSheet(f"""
+            QLabel {{
+                background: {HILITE}; border: 2px solid #ffffff;
                 border-radius: 8px; color: #ffffff;
                 padding: 1px 8px; font-size: 9px;
                 letter-spacing: 1px; font-weight: bold;
-            }
+            }}
         """)
     else:
         lbl.setStyleSheet(f"""
@@ -1265,7 +1306,7 @@ class ConnectionBar(QWidget):
         lay.addWidget(self.connect_btn)
 
         # Status pill kept for API but hidden
-        self.status_pill = pill("OFFLINE", "#c040c0")
+        self.status_pill = pill("OFFLINE", ACCENT2)
         self.status_pill.setVisible(False)
         lay.addWidget(self.status_pill)
 
@@ -1282,9 +1323,9 @@ class ConnectionBar(QWidget):
         self.data_refresh_btn.setFixedWidth(100)
         self.data_refresh_btn.setEnabled(False)
         self.data_refresh_btn.setStyleSheet(
-            f"QPushButton{{background:{SURFACE2};border:1px solid #7c3aed;"
+            f"QPushButton{{background:{SURFACE2};border:1px solid {HILITE};"
             f"border-radius:5px;color:#ffffff;font-size:11px;font-weight:bold;padding:0 10px;}}"
-            f"QPushButton:hover{{background:#7c3aed;color:#ffffff;}}"
+            f"QPushButton:hover{{background:{HILITE};color:#ffffff;}}"
             f"QPushButton:disabled{{color:{BORDER};border-color:{BORDER};background:{SURFACE};}}"
         )
 
@@ -1412,12 +1453,12 @@ class ConnectionBar(QWidget):
             f"background:transparent;border:none;"
         )
         self.status_pill.setText("OFFLINE")
-        self.status_pill.setStyleSheet("""
-            QLabel {
-                background:#7c3aed;border:2px solid #ffffff;
+        self.status_pill.setStyleSheet(f"""
+            QLabel {{
+                background:{HILITE};border:2px solid #ffffff;
                 border-radius:8px;color:#ffffff;
                 padding:1px 8px;font-size:9px;letter-spacing:1px;font-weight:bold;
-            }
+            }}
         """)
 
     def _toggle(self):
@@ -2272,26 +2313,26 @@ class SmoothFader(QWidget):
         off_h = max(0.0, hy - half_h)
         if off_h > 0:
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#0d0b1e"))
+            p.setBrush(QColor(TRACK_BG))
             p.drawRoundedRect(QRectF(track_x - track_w * 0.5, 0.0, track_w, off_h), 4.0, 4.0)
 
         # Filled track below handle
         if fill_h > 0:
             grad = QLinearGradient(0.0, h, 0.0, h - fill_h)
-            grad.setColorAt(0, QColor("#7733bb"))
-            grad.setColorAt(1, QColor("#c040c0"))
+            grad.setColorAt(0, QColor(DIM))
+            grad.setColorAt(1, QColor(ACCENT2))
             p.setBrush(grad)
             p.drawRoundedRect(QRectF(track_x - track_w * 0.5, h - fill_h, track_w, fill_h), 4.0, 4.0)
 
         # Handle body
-        handle_color = "#c040c0" if self._dragging else "#7733bb"
-        border_color = "#c040c0" if self._dragging else "#9955cc"
+        handle_color = ACCENT2 if self._dragging else DIM
+        border_color = ACCENT2 if self._dragging else BORDER
         p.setBrush(QColor(handle_color))
         p.setPen(QPen(QColor(border_color), 2))
         p.drawRoundedRect(QRectF(hx, hy - half_h, handle_w, handle_h), 4.0, 4.0)
 
         # Grip lines — 3 horizontal notches across centre
-        line_color = QColor("#ffffff" if self._dragging else "#9988cc")
+        line_color = QColor("#ffffff" if self._dragging else GRIP)
         line_color.setAlpha(160)
         p.setPen(QPen(line_color, 1))
         cx = hx + handle_w * 0.5
@@ -2440,27 +2481,27 @@ class HorizontalFader(QWidget):
         off_w = max(0, w - half_w - off_start)
         if off_w > 0:
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor("#0d0b1e"))
+            p.setBrush(QColor(TRACK_BG))
             p.drawRoundedRect(off_start, track_y - track_h//2, off_w, track_h, 3, 3)
 
         # Filled track left of handle
         fill_w = max(0, hx - half_w - left_edge + half_w)
         if fill_w > 0:
             grad = QLinearGradient(left_edge - half_w, 0, left_edge - half_w + fill_w, 0)
-            grad.setColorAt(0, QColor("#7733bb"))
-            grad.setColorAt(1, QColor("#c040c0"))
+            grad.setColorAt(0, QColor(DIM))
+            grad.setColorAt(1, QColor(ACCENT2))
             p.setBrush(grad)
             p.drawRoundedRect(left_edge - half_w, track_y - track_h//2, fill_w, track_h, 3, 3)
 
         # Handle
-        handle_color = "#c040c0" if self._dragging else "#7733bb"
-        border_color = "#c040c0" if self._dragging else "#9955cc"
+        handle_color = ACCENT2 if self._dragging else DIM
+        border_color = ACCENT2 if self._dragging else BORDER
         p.setBrush(QColor(handle_color))
         p.setPen(QPen(QColor(border_color), 2))
         p.drawRoundedRect(hx - half_w, hy, handle_w, handle_h, 4, 4)
 
         # Grip lines — 3 vertical notches
-        line_color = QColor("#ffffff" if self._dragging else "#9988cc")
+        line_color = QColor("#ffffff" if self._dragging else GRIP)
         line_color.setAlpha(160)
         p.setPen(QPen(line_color, 1))
         cy = track_y
@@ -2550,8 +2591,8 @@ class PoofOverlay(QWidget):
             size = random.uniform(3, 10)
             # Purple/magenta palette
             color = random.choice([
-                "#c040c0", "#7c3aed", "#a855f7", "#9955cc",
-                "#ffffff", "#e0d0ff", "#ff66ff",
+                ACCENT2, HILITE, HILITE_BORDER, BORDER,
+                "#ffffff", WARN, SPARKLE,
             ])
             self._particles.append({
                 "x": float(cx), "y": float(cy),
@@ -2643,14 +2684,14 @@ class SparkleRing(QWidget):
         alpha = max(0, int(200 * (1.0 - progress)))
 
         # Ring
-        c = QColor("#c040c0")
+        c = QColor(ACCENT2)
         c.setAlpha(alpha)
         p.setPen(QPen(c, 2.5))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(QPointF(self._cx, self._cy), radius, radius)
 
         # Inner glow
-        c2 = QColor("#7c3aed")
+        c2 = QColor(HILITE)
         c2.setAlpha(alpha // 2)
         p.setPen(QPen(c2, 1))
         p.drawEllipse(QPointF(self._cx, self._cy), radius * 0.6, radius * 0.6)
@@ -2739,7 +2780,7 @@ class ModBar(QWidget):
 
         # Background
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#1a1433"))
+        p.setBrush(QColor(BAR_BG))
         p.drawRoundedRect(0, 0, w, h, 3, 3)
 
         if not self._active or len(self._history) < 2:
@@ -2752,9 +2793,9 @@ class ModBar(QWidget):
         step_x = w / max(1, hist_len - 1)
         start_x = w - (n - 1) * step_x
 
-        fill_color = QColor("#7c3aed")
+        fill_color = QColor(HILITE)
         fill_color.setAlpha(60)
-        line_color = QColor("#c040c0")
+        line_color = QColor(ACCENT2)
 
         if self._style == self.STYLE_AUDIO:
             # Symmetric around vertical center — looks like an audio waveform.
@@ -3002,7 +3043,7 @@ class ChannelCard(QWidget):
                     font-size:11px; font-weight:bold; padding:2px 8px;
                 }}
                 QPushButton:checked {{
-                    background:#7c3aed; border:2px solid #ffffff;
+                    background:{HILITE}; border:2px solid #ffffff;
                     color:#ffffff;
                 }}
             """)
@@ -3392,7 +3433,7 @@ class ChannelCard(QWidget):
         if active:
             # Lit up — purple background, white text
             self.op_combo.setStyleSheet(
-                f"QComboBox{{background:#7c3aed;border:1px solid #a855f7;"
+                f"QComboBox{{background:{HILITE};border:1px solid {HILITE_BORDER};"
                 f"border-radius:2px;color:#ffffff;font-size:11px;font-weight:bold;padding:0px 4px;}}"
                 f"QComboBox:hover{{border-color:#ffffff;}}"
                 f"QComboBox::drop-down{{border:none;width:12px;}}"
@@ -3672,7 +3713,10 @@ class ParametersTab(QWidget):
             col12.addWidget(tss_lbl12)
             tss12_row.addLayout(col12)
             tss12_row.addStretch(1)
-        card12._update_tss_enabled(card12.get_operator())   # new knobs start locked
+        # TSS starts locked while the source is Disabled. Deferred: the P7–P11
+        # switch cards are built further down this constructor.
+        QTimer.singleShot(0, lambda: [c._update_tss_enabled(c.get_operator())
+                                      for c in self.channels])
         fader_v.addLayout(tss12_row)
         fader_v.addSpacing(2)
 
@@ -3901,13 +3945,13 @@ class ParametersTab(QWidget):
         self.transport_playing = playing
         if playing:
             self.start_btn.setStyleSheet(
-                f"QPushButton{{background:#7c3aed;border:2px solid #a855f7;"
+                f"QPushButton{{background:{HILITE};border:2px solid {HILITE_BORDER};"
                 f"color:#ffffff;font-weight:bold;border-radius:4px;padding:7px 18px;}}"
             )
             self.stop_btn.setStyleSheet("")
         else:
             self.stop_btn.setStyleSheet(
-                f"QPushButton{{background:#7c3aed;border:2px solid #a855f7;"
+                f"QPushButton{{background:{HILITE};border:2px solid {HILITE_BORDER};"
                 f"color:#ffffff;font-weight:bold;border-radius:4px;padding:7px 18px;}}"
             )
             self.start_btn.setStyleSheet("")
@@ -3917,9 +3961,9 @@ class ParametersTab(QWidget):
     def flash_tap(self):
         """Briefly light up the TAP button — color only, no bounce."""
         self.tap_btn.setStyleSheet(
-            f"QPushButton{{background:#c040c0;border:2px solid #ffffff;"
+            f"QPushButton{{background:{ACCENT2};border:2px solid #ffffff;"
             f"border-radius:4px;color:#ffffff;font-weight:bold;padding:7px 18px;}}"
-            f"QPushButton:pressed{{background:#c040c0;border:2px solid #ffffff;color:#ffffff;}}"
+            f"QPushButton:pressed{{background:{ACCENT2};border:2px solid #ffffff;color:#ffffff;}}"
         )
         QTimer.singleShot(80, self._reset_tap_style)
 
@@ -4757,6 +4801,25 @@ class SystemTab(QWidget):
             layout.addLayout(g)
 
         top_row = QHBoxLayout()
+        theme_lbl = QLabel("Theme")
+        theme_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:13px;{self._TRANSPARENT}")
+        top_row.addWidget(theme_lbl)
+        self.on_theme = None           # (name) — set by the main window
+        self._theme_btns = {}
+        for key, label in (("purple", "PURPLE"), ("amber", "AMBER")):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setChecked(key == THEME)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            sw = THEMES[key]
+            b.setStyleSheet(
+                f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};border-radius:4px;"
+                f"color:{TEXT_DIM};font-size:11px;font-weight:bold;padding:5px 12px;}}"
+                f"QPushButton:checked{{background:{sw['HILITE']};border-color:{sw['ACCENT']};"
+                f"color:#ffffff;}}")
+            b.clicked.connect(lambda _c, k=key: self._pick_theme(k))
+            top_row.addWidget(b)
+            self._theme_btns[key] = b
         top_row.addStretch(1)
         self.refresh_btn = QPushButton("\u21bb  Refresh")
         self.refresh_btn.setEnabled(False)
@@ -5109,6 +5172,12 @@ class SystemTab(QWidget):
         if version:
             self._device_fw = version
         self._refresh_fw_compare()
+
+    def _pick_theme(self, key: str):
+        for k, b in self._theme_btns.items():
+            b.setChecked(k == key)
+        if key != THEME and self.on_theme:
+            self.on_theme(key)
 
     def set_latest_firmware(self, latest: str):
         self._latest_fw = latest
@@ -6154,6 +6223,7 @@ class VideomancerApp(QMainWindow):
         self._install_shortcuts()
         self.library_tab.on_refresh = lambda: self._lib_refresh(force=True)
         self.system_tab.on_open_library = lambda: self.tabs.setCurrentIndex(4)
+        self.system_tab.on_theme = lambda k: QTimer.singleShot(0, lambda: _switch_theme(k))
         self.library_tab.on_open_release = self._lib_open_release
         self.library_tab.on_install = self._lib_install
         self.library_tab.on_remove = self._lib_remove
@@ -6290,7 +6360,7 @@ class VideomancerApp(QMainWindow):
                 font-size:10px; font-weight:bold; padding:2px 8px;
             }}
             QPushButton:checked {{
-                background:#7c3aed; border:2px solid #ffffff;
+                background:{HILITE}; border:2px solid #ffffff;
                 color:#ffffff;
             }}
         """)
@@ -6307,12 +6377,12 @@ class VideomancerApp(QMainWindow):
         self._update_btn.setVisible(False)
         self._update_btn.setStyleSheet(f"""
             QPushButton {{
-                background:#2d1f5e; border:1px solid {ACCENT};
-                border-radius:3px; color:#a78bfa;
+                background:{SEL_BG}; border:1px solid {ACCENT};
+                border-radius:3px; color:{SEL_TEXT};
                 font-size:9px; font-weight:bold; padding:1px 6px;
             }}
             QPushButton:hover {{
-                background:#3d2f7e; color:#ffffff;
+                background:{SEL_BG2}; color:#ffffff;
             }}
         """)
         self._update_btn.clicked.connect(self._open_update_url)
@@ -7993,6 +8063,20 @@ fi
 
 # ── Entry point ────────────────────────────────────────────────────────
 
+def _switch_theme(name: str):
+    """Remember the theme, then rebuild every window in it (widgets read the
+    colour names when they're built). Each window closes — releasing its
+    port — and a fresh one reconnects automatically on the System tab."""
+    _app_settings().setValue("appearance/theme", name)
+    _apply_theme(name)
+    for old in list(_app_windows):
+        number, geo = old._window_number, old.geometry()
+        old.close()
+        new = _spawn_window(number)
+        new.setGeometry(geo)
+        new.tabs.setCurrentIndex(2)
+
+
 def _spawn_window(number: int) -> VideomancerApp:
     """Create and show a new VideomancerApp window."""
     w = VideomancerApp(window_number=number)
@@ -8071,6 +8155,7 @@ def main():
     # when the bundle on disk is `VideomancerControl.app` (no space).
     app.setApplicationDisplayName("Videomancer Control")
     app.setOrganizationName("LZX Industries")
+    _apply_theme(_app_settings().value("appearance/theme", "purple") or "purple")
 
     # Offer to move into /Applications if running from Downloads/Desktop.
     # Must run after QApplication is created (we use a Qt dialog).
