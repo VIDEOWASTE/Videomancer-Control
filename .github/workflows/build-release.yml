@@ -222,16 +222,16 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
-            ### New in 2.6.1
-            - **Time / Space / Slope knobs fixed** — they now send the firmware's current command form, so turning them changes the device and the knobs no longer snap back.
-            - Program changes made on the Videomancer itself show up within a few seconds.
+            ### New in 2.7
+            - **Program Library tab** — browse LZX's official and community program libraries (every release), see what's on your SD card, and install, update or remove programs over USB. Downloads are checksum-verified; the app picks a library your firmware can run, warns before newer-firmware libraries, older versions, or running out of space.
+            - **MY PROGRAMS** — your own programs on the card, with whether the Videomancer loaded them.
+            - **70-program limit shown** — the Videomancer loads at most 70 programs from the SD card; the Library tab shows how many are skipped.
+            - **Purple / Amber theme** toggle on the System tab.
+            - **Favorite stars** at the end of each program row; **LZX Resources** section with LZX Connect, the manual and more.
+            - Time / Space / Slope knobs lock while a parameter's modulation source is Disabled (the firmware ignores them then).
 
-            ### Highlights of 2.6
-            - **One universal Mac download** — a single DMG runs natively on Apple Silicon and Intel.
-            - **In-app updates actually fire** — downloads, installs and relaunches in place.
-            - **Real parameter names and units** from each program; unused slots are dimmed.
-            - **Smoother, more reliable control sync**, and failed program loads are reported instead of hidden.
-            - **Firmware check** with a one-click LZX Connect link, **device health**, **favorites & recent programs**, **Randomize / Undo**, **keyboard shortcuts**, cleaner System and State tabs.
+            ### Earlier in 2.6.x
+            - Universal Mac DMG, working in-app updates, real parameter names and units, reliable control sync, Time/Space/Slope fix, firmware check, device health, Randomize/Undo, keyboard shortcuts.
 
             ### Downloads
             - **macOS (Apple Silicon + Intel)**: `VideomancerControl_macOS.dmg` — open it and drag the app to Applications.

@@ -42,7 +42,9 @@ The app auto-connects whenever you plug in your Videomancer. No manual port conf
 
 ## Features
 
-- **Program Browser** — search, browse, and load FPGA programs by name; ★ favorites and a recently-loaded list
+- **Program Browser** — search, browse, and load FPGA programs by name; a ☆ at the end of each row marks favorites, plus a recently-loaded list
+- **Program Library** — browse LZX's official and community libraries, see what's on your SD card, and install / update / remove programs over USB (checksum-verified, firmware-compatibility and free-space checks). **MY PROGRAMS** lists your own programs on the card. Shows the 70-program load limit.
+- **Themes** — Videomancer Purple or Amber (System tab)
 - **Firmware Check** — compares your Videomancer's firmware with LZX's newest release and links straight to LZX Connect when an update is out
 - **Device Health** — CPU, memory, FPGA state and SD card space on the System tab
 - **Keyboard Shortcuts** — Space play/stop · T tap tempo · ⌘1–4 switch tabs · ⌘F find a program · ⌘R refresh
