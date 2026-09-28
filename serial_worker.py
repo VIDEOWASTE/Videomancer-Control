@@ -20,6 +20,8 @@ class SerialWorker(QThread):
     error         = pyqtSignal(str)
     programs_page = pyqtSignal(list, bool, int, int)
     status_update = pyqtSignal(dict)
+    put_progress  = pyqtSignal(str, int, int)     # path, bytes sent, total
+    put_finished  = pyqtSignal(str, bool, str)    # path, ok, message
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -32,6 +34,8 @@ class SerialWorker(QThread):
         # send_immediate() writes from the GUI thread while run() writes from
         # the worker thread; serialise them so two commands never interleave.
         self._write_lock = threading.Lock()
+        self._put_jobs  = []    # (sd path, bytes) — run one at a time in run()
+        self._put_active = False
 
     def connect_port(self, port: str):
         self._port = port
@@ -48,8 +52,17 @@ class SerialWorker(QThread):
 
     def send_immediate(self, command: str):
         """Write directly to serial, bypassing the queue. Use for latency-critical commands."""
-        if self._serial and self._running:
+        if self._put_active:
+            self.send(command)     # never interleave with an fs put payload
+        elif self._serial and self._running:
             self._write(command + "\n")
+
+    def put_file(self, path: str, data: bytes):
+        """Queue an upload via `fs put <path> <size>`. The worker runs it with
+        exclusive use of the link and reports put_progress / put_finished."""
+        self._mutex.lock()
+        self._put_jobs.append((path, bytes(data)))
+        self._mutex.unlock()
 
     def get_version(self):   self.send("version")
     def get_status(self):    self.send("status")
@@ -116,6 +129,14 @@ class SerialWorker(QThread):
         _read_errors = 0
 
         while self._running:
+            # 0. File uploads own the link until done; queued commands wait.
+            self._mutex.lock()
+            job = self._put_jobs.pop(0) if self._put_jobs else None
+            self._mutex.unlock()
+            if job is not None:
+                self._run_put(*job)
+                continue
+
             # 1. Send all queued commands
             self._mutex.lock()
             cmds = list(self._cmd_queue)
@@ -161,6 +182,71 @@ class SerialWorker(QThread):
         except Exception:
             pass
         self.disconnected.emit()
+
+    # ------------------------------------------------------------------
+    # fs put — raw streaming upload
+    # ------------------------------------------------------------------
+
+    PUT_CHUNK = 4096
+    PUT_BYTES_PER_SECOND = 150_000   # measured ~157-166 kB/s on hardware
+
+    def _pump_lines(self, want, timeout: float):
+        """Read and dispatch lines until `want(line)` matches one (returned) or
+        the timeout passes (None). Every line is still dispatched normally."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self._running:
+            try:
+                waiting = self._serial.in_waiting
+                if waiting:
+                    self._buf += self._serial.read(waiting)
+            except Exception:
+                self._running = False
+                return None
+            while b"\n" in self._buf:
+                raw, self._buf = self._buf.split(b"\n", 1)
+                line = ANSI_RE.sub("", raw.decode("ascii", errors="replace")).strip()
+                if not line:
+                    continue
+                self._dispatch(line)
+                if want(line):
+                    return line
+            time.sleep(0.005)
+        return None
+
+    def _run_put(self, path: str, data: bytes):
+        """`fs put <path> <size>` → {"put":"ready"} → exactly <size> raw bytes →
+        {"put":"ok","written":n}. Between ready and the last byte the device
+        treats EVERYTHING it receives as file content, so nothing else may be
+        written until the payload is complete — abandoning it strands the
+        device until it gets the promised bytes or is power-cycled."""
+        size = len(data)
+        self._put_active = True
+        try:
+            is_put_reply = lambda l: (l.startswith("@fs:") and '"put"' in l) or l.startswith("!")
+            self._write(f"fs put {path} {size}\n")
+            line = self._pump_lines(is_put_reply, 10.0)
+            if not line or '"ready"' not in line:
+                self.put_finished.emit(path, False, line or "no reply to fs put")
+                return
+            sent = 0
+            for off in range(0, size, self.PUT_CHUNK):
+                chunk = data[off:off + self.PUT_CHUNK]
+                with self._write_lock:
+                    # Blocking write: the device stalls while committing to the
+                    # card; a short stall must not abandon the transfer.
+                    self._serial.write(chunk)
+                sent += len(chunk)
+                self.put_progress.emit(path, sent, size)
+            with self._write_lock:
+                self._serial.flush()
+            timeout = max(20.0, 4.0 * size / self.PUT_BYTES_PER_SECOND)
+            line = self._pump_lines(is_put_reply, timeout)
+            ok = bool(line) and '"ok"' in line and f'"written":{size}' in line.replace(" ", "")
+            self.put_finished.emit(path, ok, line or "no confirmation after upload")
+        except Exception as exc:
+            self.put_finished.emit(path, False, f"upload failed: {exc}")
+        finally:
+            self._put_active = False
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QStatusBar, QFrame, QSplitter, QTextEdit, QGroupBox,
     QTabWidget, QSlider, QCheckBox, QScrollArea, QGridLayout,
     QSizePolicy, QMessageBox, QInputDialog, QDialog, QDialogButtonBox,
-    QFileDialog,
+    QFileDialog, QTreeWidget, QTreeWidgetItem, QHeaderView,
 )
 import math
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QThread, QRectF, QPointF
@@ -113,6 +113,204 @@ class _FirmwareChecker(QThread):
                 self.latest_found.emit(best[1])
         except Exception:
             pass  # offline is fine — the check is advisory
+
+
+# ── Program library (official LZX + community) ────────────────────────
+#
+# LZX publishes SD program libraries as GitHub release zips that mirror the
+# card's layout: programs/<vendor>/<name>.vmprog (+ programs/manifest.json
+# for the official library). The app installs them over USB with `fs put`.
+
+LIBRARY_SOURCES = [
+    {"key": "official", "label": "OFFICIAL LZX",
+     "repo": "lzxindustries/videomancer-firmware", "tag_prefix": "programs/"},
+    {"key": "community", "label": "COMMUNITY",
+     "repo": "lzxindustries/videomancer-community-programs", "tag_prefix": ""},
+]
+SD_PROGRAMS = "sd:/programs"
+
+
+def _library_cache_dir() -> Path:
+    from PyQt6.QtCore import QStandardPaths
+    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation)
+    d = Path(base or tempfile_dir()) / "library"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def tempfile_dir() -> str:
+    import tempfile
+    return tempfile.gettempdir()
+
+
+def _vmprog_info(data: bytes) -> Optional[dict]:
+    """Program metadata from a .vmprog: 64-byte 'VMPG' header, then a TOC of
+    64-byte entries; entry type 1 is the program config (SDK vmprog-format.md)."""
+    import struct
+    try:
+        if len(data) < 64 or data[:4] != b"VMPG":
+            return None
+        toc_off, _toc_bytes, toc_count = struct.unpack_from("<III", data, 20)
+        for i in range(min(toc_count, 64)):
+            etype, _flags, off, size = struct.unpack_from("<IIII", data, toc_off + i * 64)
+            if etype != 1:
+                continue
+            cfg = data[off:off + size]
+            text = lambda a, n: cfg[a:a + n].split(b"\0", 1)[0].decode("utf-8", "replace").strip()
+            major, minor, patch = struct.unpack_from("<HHH", cfg, 64)
+            return {"program_id": text(0, 64), "version": f"{major}.{minor}.{patch}",
+                    "name": text(86, 32), "author": text(118, 64),
+                    "description": text(470, 128)}
+    except Exception:
+        pass
+    return None
+
+
+def _prog_version_key(v: str):
+    """'1.0.2' → (1, 0, 2); None if unparseable."""
+    m = re.match(r"\s*v?(\d+)\.(\d+)(?:\.(\d+))?", str(v or ""))
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+
+def _library_target_firmware(notes: str) -> str:
+    """'…rebuilt for Videomancer 1.0.0-rc.61…' → '1.0.0-rc.61' ('' if absent)."""
+    m = re.search(r"Videomancer\W{0,4}(\d+\.\d+\.\d+(?:-rc\.?\d+)?)", notes or "")
+    return m.group(1) if m else ""
+
+
+class _LibraryIndexFetcher(QThread):
+    """Lists published library releases for both sources (newest first)."""
+    releases_ready = pyqtSignal(dict)     # source key → [release dicts]
+    failed = pyqtSignal(str)
+
+    def run(self):
+        from urllib.request import urlopen, Request
+        out = {}
+        try:
+            for src in LIBRARY_SOURCES:
+                url = f"https://api.github.com/repos/{src['repo']}/releases?per_page=40"
+                req = Request(url, headers={"Accept": "application/vnd.github+json",
+                                            "User-Agent": "VideomancerControl"})
+                with urlopen(req, timeout=15) as resp:
+                    rels = json.loads(resp.read().decode())
+                rows = []
+                for r in rels:
+                    tag = r.get("tag_name", "")
+                    if r.get("draft") or not tag.startswith(src["tag_prefix"]):
+                        continue
+                    if src["tag_prefix"] == "" and "/" in tag:
+                        continue          # sdk/… etc. in the community repo
+                    assets = r.get("assets") or []
+                    zips = [a for a in assets if a["name"].endswith(".zip")
+                            and ("program" in a["name"])]
+                    if not zips:
+                        continue
+                    shas = [a for a in assets if a["name"].endswith(".sha256")]
+                    rows.append({
+                        "source": src["key"], "tag": tag,
+                        "version": tag[len(src["tag_prefix"]):],
+                        "date": (r.get("published_at") or "")[:10],
+                        "prerelease": bool(r.get("prerelease")),
+                        "zip_name": zips[0]["name"],
+                        "zip_url": zips[0]["browser_download_url"],
+                        "sha_url": shas[0]["browser_download_url"] if shas else "",
+                        "target_fw": _library_target_firmware(r.get("body", "")),
+                        "notes": (r.get("body") or "").strip(),
+                    })
+                out[src["key"]] = rows
+            self.releases_ready.emit(out)
+        except Exception as exc:
+            self.failed.emit(f"Couldn't reach GitHub: {exc}")
+
+
+class _LibraryDownloader(QThread):
+    """Downloads (or reuses a cached) library zip, verifies its SHA-256, and
+    reads every program's metadata from inside the zip."""
+    progress = pyqtSignal(int, int)
+    done = pyqtSignal(dict, list)         # release (+ "zip_path", "manifest"), programs
+    failed = pyqtSignal(str)
+
+    def __init__(self, release: dict, parent=None):
+        super().__init__(parent)
+        self.release = dict(release)
+
+    def run(self):
+        import hashlib, zipfile
+        from urllib.request import urlopen, Request
+        rel = self.release
+        try:
+            expected = ""
+            path = _library_cache_dir() / rel["zip_name"]
+            if rel.get("sha_url"):
+                req = Request(rel["sha_url"], headers={"User-Agent": "VideomancerControl"})
+                try:
+                    with urlopen(req, timeout=15) as resp:
+                        sums = resp.read().decode()
+                except OSError:
+                    if not path.exists():
+                        raise
+                    # Offline: reuse the zip, checked against the digest we
+                    # saved when it was first verified.
+                    sums = _app_settings().value(f"library/sha/{rel['zip_name']}", "") or ""
+                for line in sums.splitlines():
+                    parts = line.split()
+                    if parts and re.fullmatch(r"[0-9a-f]{64}", parts[0]) and \
+                            (len(parts) == 1 or rel["zip_name"] in line):
+                        expected = parts[0]
+                        break
+            if not (path.exists() and expected and
+                    hashlib.sha256(path.read_bytes()).hexdigest() == expected):
+                req = Request(rel["zip_url"], headers={"User-Agent": "VideomancerControl"})
+                tmp = path.with_suffix(".part")
+                with urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    got = 0
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        self.progress.emit(got, total)
+                tmp.replace(path)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if expected and digest != expected:
+                path.unlink(missing_ok=True)
+                self.failed.emit("Download didn't match LZX's published checksum — "
+                                 "try again.")
+                return
+            rel["zip_path"] = str(path)
+            rel["verified"] = bool(expected)
+            if expected:
+                _app_settings().setValue(f"library/sha/{rel['zip_name']}", expected)
+            programs, manifest = [], None
+            with zipfile.ZipFile(path) as z:
+                if "programs/manifest.json" in z.namelist():
+                    manifest = json.loads(z.read("programs/manifest.json").decode())
+                by_file = {e.get("file"): e for e in (manifest or {}).get("programs", [])}
+                for name in sorted(z.namelist()):
+                    parts = name.split("/")
+                    if not name.endswith(".vmprog") or len(parts) != 3 or parts[0] != "programs":
+                        continue
+                    data = z.read(name)
+                    info = _vmprog_info(data) or {}
+                    rel_file = f"{parts[1]}/{parts[2]}"
+                    m = by_file.get(rel_file, {})
+                    programs.append({
+                        "file": rel_file, "zip_member": name, "size": len(data),
+                        "sd_path": f"{SD_PROGRAMS}/{rel_file}",
+                        "name": m.get("program_name") or info.get("name") or parts[2][:-7],
+                        "author": m.get("author") or info.get("author", ""),
+                        "version": m.get("program_version") or info.get("version", ""),
+                        "description": m.get("description") or info.get("description", ""),
+                        "categories": m.get("categories") or [],
+                        "program_id": m.get("program_id") or info.get("program_id", ""),
+                        "manifest_entry": m or None,
+                    })
+            rel["manifest"] = manifest
+            self.done.emit(rel, programs)
+        except Exception as exc:
+            self.failed.emit(f"Library download failed: {exc}")
 
 
 class _UpdateDownloader(QThread):
@@ -4558,6 +4756,14 @@ class SystemTab(QWidget):
                 store[key] = val
             layout.addLayout(g)
 
+        top_row = QHBoxLayout()
+        top_row.addStretch(1)
+        self.refresh_btn = QPushButton("\u21bb  Refresh")
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.clicked.connect(self._refresh)
+        top_row.addWidget(self.refresh_btn)
+        root.addLayout(top_row)
+
         # Two equal columns; every section visible at the default window size
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
@@ -4729,35 +4935,54 @@ class SystemTab(QWidget):
 
         root.addLayout(grid)
 
-        # ·· Links + refresh, one compact row ··
-        links = QHBoxLayout()
-        links.setSpacing(6)
+        # ·· LZX resources: each link says what it's for ··
+        res_grp = QGroupBox("LZX RESOURCES")
+        rg = QGridLayout(res_grp)
+        rg.setHorizontalSpacing(8)
+        rg.setVerticalSpacing(8)
+        self.on_open_library = None      # set by the main window
         self._doc_links = [
-            # LZX's official firmware / program-library updater (Mac, Win, Linux)
-            ("LZX Connect", "https://lzxindustries.net/connect"),
-            ("Manual", "https://lzxindustries.net/instruments/videomancer/manual"),
-            ("Firmware", "https://github.com/lzxindustries/videomancer-firmware"),
-            ("Community", "https://community.lzxindustries.net/"),
-            ("App Releases", f"https://github.com/{GITHUB_REPO}/releases"),
+            ("LZX Connect", "Update firmware and install program libraries",
+             LZX_CONNECT_URL),
+            ("Program Library", "Browse and install official & community programs",
+             "library:"),
+            ("Videomancer Manual", "Official guide and serial command reference",
+             "https://lzxindustries.net/instruments/videomancer/manual"),
+            ("Firmware Releases", "Version history and release notes",
+             f"https://github.com/{FIRMWARE_REPO}/releases"),
+            ("Community Forum", "Help desk, patches and discussion",
+             "https://community.lzxindustries.net/"),
+            ("App Releases", "Videomancer Control downloads and changelog",
+             f"https://github.com/{GITHUB_REPO}/releases"),
         ]
-        for label, url in self._doc_links:
-            btn = QPushButton(label)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setToolTip(url)
-            btn.setStyleSheet(
+        for i, (title, blurb, url) in enumerate(self._doc_links):
+            card = QPushButton()
+            card.setCursor(Qt.CursorShape.PointingHandCursor)
+            card.setToolTip(url if url != "library:" else "Open the LIBRARY tab")
+            card.setMinimumHeight(54)
+            card.setStyleSheet(
                 f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
-                f"border-radius:4px;color:{ACCENT};font-size:12px;"
-                f"font-weight:bold;padding:5px 8px;}}"
-                f"QPushButton:hover{{background:{DIM};border-color:{ACCENT};color:#ffffff;}}"
-            )
-            btn.clicked.connect(lambda checked, u=url: self._open_doc(u))
-            links.addWidget(btn, stretch=1)
-        links.addSpacing(8)
-        self.refresh_btn = QPushButton("\u21bb  Refresh")
-        self.refresh_btn.setEnabled(False)
-        self.refresh_btn.clicked.connect(self._refresh)
-        links.addWidget(self.refresh_btn)
-        root.addLayout(links)
+                f"border-radius:6px;text-align:left;padding:0;}}"
+                f"QPushButton:hover{{background:{DIM};border-color:#ffffff;}}")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(12, 6, 12, 6)
+            cl.setSpacing(1)
+            t = QLabel(title + ("  \u2197" if url.startswith("http") else "  \u2192"))
+            t.setStyleSheet(f"color:#ffffff;font-size:14px;font-weight:bold;{self._TRANSPARENT}")
+            b = QLabel(blurb)
+            b.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;{self._TRANSPARENT}")
+            for lbl in (t, b):
+                lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                cl.addWidget(lbl)
+            if url == "library:":
+                card.clicked.connect(lambda _c: self.on_open_library and self.on_open_library())
+            else:
+                card.clicked.connect(lambda _c, u=url: self._open_doc(u))
+            rg.addWidget(card, i // 3, i % 3)
+        for c in range(3):
+            rg.setColumnStretch(c, 1)
+        root.addWidget(res_grp)
+
         root.addStretch(1)
 
     def set_connected(self, v: bool):
@@ -5353,6 +5578,398 @@ class StateTab(QWidget):
 
 # ── Main window ────────────────────────────────────────────────────────
 
+# ── Program Library tab ───────────────────────────────────────────────
+
+class LibraryTab(QWidget):
+    """Browse LZX's official and community program libraries, see what's on
+    the Videomancer's SD card, and install / remove programs over USB."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.on_refresh = None        # ()
+        self.on_open_release = None   # (release)
+        self.on_install = None        # (release, [programs])
+        self.on_remove = None         # ([programs])
+        self.on_add_file = None       # (path)
+        self._releases = {}           # source → [release]
+        self._source = "official"
+        self._release = None
+        self._programs = []
+        self._device_files = None     # {"vendor/file.vmprog": size} or None if unknown
+        self._device_names = set()    # program names in the device's boot index
+        self._device_versions = {}    # "vendor/file.vmprog" → version from the card manifest
+        self._device_fw = ""
+        self._connected = False
+        self._busy = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 8)
+        root.setSpacing(8)
+        note_css = f"color:{TEXT_DIM};font-size:12px;background:transparent;border:none;"
+
+        # Source + version row
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self._src_btns = {}
+        for src in LIBRARY_SOURCES:
+            b = QPushButton(src["label"])
+            b.setCheckable(True)
+            b.setChecked(src["key"] == self._source)
+            b.setStyleSheet(
+                f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};border-radius:4px;"
+                f"color:{TEXT_DIM};font-size:12px;font-weight:bold;padding:6px 12px;}}"
+                f"QPushButton:checked{{background:{DIM};color:#ffffff;border-color:#ffffff;}}")
+            b.clicked.connect(lambda _c, k=src["key"]: self._set_source(k))
+            top.addWidget(b)
+            self._src_btns[src["key"]] = b
+        top.addSpacing(10)
+        ver_lbl = QLabel("Version")
+        ver_lbl.setStyleSheet(note_css)
+        top.addWidget(ver_lbl)
+        self.version_combo = QComboBox()
+        self.version_combo.setMinimumWidth(230)
+        self.version_combo.currentIndexChanged.connect(self._on_version_changed)
+        top.addWidget(self.version_combo, stretch=1)
+        self.refresh_btn = QPushButton("\u21bb  Refresh")
+        self.refresh_btn.clicked.connect(lambda: self.on_refresh and self.on_refresh())
+        top.addWidget(self.refresh_btn)
+        root.addLayout(top)
+
+        # Compatibility / info banner
+        self.banner = QLabel("")
+        self.banner.setWordWrap(True)
+        self.banner.setVisible(False)
+        root.addWidget(self.banner)
+
+        # Program list
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(4)
+        self.tree.setHeaderLabels(["Program", "Author", "Version", "On your Videomancer"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        hdr = self.tree.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c in (1, 2, 3):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.setStyleSheet(
+            f"QTreeWidget{{background:{SURFACE};border:1px solid {BORDER};border-radius:6px;"
+            f"color:{TEXT};font-size:13px;}}"
+            f"QTreeWidget::item{{padding:4px 2px;}}"
+            f"QTreeWidget::item:selected{{background:{DIM};color:#ffffff;}}"
+            f"QHeaderView::section{{background:{SURFACE2};color:{TEXT_DIM};border:none;"
+            f"padding:4px 6px;font-size:11px;font-weight:bold;}}")
+        self.tree.currentItemChanged.connect(self._on_current)
+        self.tree.itemChanged.connect(lambda *_: self._update_buttons())
+        root.addWidget(self.tree, stretch=1)
+
+        self.desc = QLabel("")
+        self.desc.setWordWrap(True)
+        self.desc.setMinimumHeight(34)
+        self.desc.setStyleSheet(f"color:{TEXT};font-size:12px;font-style:italic;"
+                                f"background:transparent;border:none;")
+        root.addWidget(self.desc)
+
+        # Actions
+        act = QHBoxLayout()
+        act.setSpacing(6)
+        self.sel_all_btn = QPushButton("Select not installed")
+        self.sel_all_btn.clicked.connect(self._select_missing)
+        self.update_all_btn = QPushButton("\u21bb  Update all")
+        self.update_all_btn.setToolTip("Install this library's version of every program "
+                                       "whose copy on the card is older or a different build")
+        self.update_all_btn.clicked.connect(self._update_all)
+        self.sel_none_btn = QPushButton("Clear")
+        self.sel_none_btn.clicked.connect(lambda: self._check_all(False))
+        self.add_file_btn = QPushButton("Add .vmprog file\u2026")
+        self.add_file_btn.clicked.connect(self._pick_file)
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.setObjectName("danger")
+        self.remove_btn.clicked.connect(self._remove_checked)
+        self.install_btn = QPushButton("\u2B07  INSTALL")
+        self.install_btn.setObjectName("primary")
+        self.install_btn.clicked.connect(self._install_checked)
+        for b in (self.sel_all_btn, self.sel_none_btn, self.add_file_btn, self.update_all_btn):
+            act.addWidget(b)
+        act.addStretch(1)
+        act.addWidget(self.remove_btn)
+        act.addWidget(self.install_btn)
+        root.addLayout(act)
+
+        from PyQt6.QtWidgets import QProgressBar
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.setVisible(False)
+        root.addWidget(self.progress)
+        self.status = QLabel("New programs appear after you power-cycle the Videomancer.")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(note_css)
+        root.addWidget(self.status)
+        self._update_buttons()
+
+    # ── state from the controller ──
+    def set_connected(self, v: bool):
+        self._connected = v
+        if not v:
+            self._device_files = None
+            self._device_names = set()
+        self._render()
+
+    def set_device_firmware(self, fw: str):
+        self._device_fw = fw or ""
+        self._render_banner()
+
+    def set_device_programs(self, files, names, versions=None):
+        self._device_files = dict(files) if files is not None else None
+        self._device_names = set(names or [])
+        self._device_versions = dict(versions or {})   # file → version (card manifest)
+        self._render()
+
+    def set_releases(self, releases: dict):
+        self._releases = releases
+        self._fill_versions()
+
+    def set_programs(self, release: dict, programs: list):
+        self._release = release
+        self._programs = programs
+        self._render()
+
+    def set_busy(self, busy: bool, msg: str = ""):
+        self._busy = busy
+        self.progress.setVisible(busy)
+        if msg:
+            self.status.setText(msg)
+        for w in (self.version_combo, self.refresh_btn, *self._src_btns.values()):
+            w.setEnabled(not busy)
+        self._update_buttons()
+
+    def set_progress(self, done: int, total: int, msg: str = ""):
+        self.progress.setVisible(True)
+        self.progress.setMaximum(max(1, total))
+        self.progress.setValue(done)
+        if msg:
+            self.status.setText(msg)
+
+    # ── UI internals ──
+    def _set_source(self, key: str):
+        self._source = key
+        for k, b in self._src_btns.items():
+            b.setChecked(k == key)
+        self._fill_versions()
+
+    def _fill_versions(self):
+        rows = self._releases.get(self._source, [])
+        self.version_combo.blockSignals(True)
+        self.version_combo.clear()
+        for r in rows:
+            label = r["version"] + ("  (pre-release)" if r["prerelease"] else "")
+            if r["target_fw"]:
+                label += f"  \u00b7  for firmware {r['target_fw']}"
+            self.version_combo.addItem(label, r)
+        # Default: newest release this Videomancer's firmware can run
+        pick = 0
+        dev = _fw_version_key(self._device_fw)
+        if dev:
+            for i, r in enumerate(rows):
+                tgt = _fw_version_key(r["target_fw"])
+                if not r["prerelease"] and (tgt is None or tgt <= dev):
+                    pick = i
+                    break
+        self.version_combo.setCurrentIndex(pick if rows else -1)
+        self.version_combo.blockSignals(False)
+        self._on_version_changed()
+
+    def _on_version_changed(self, *_):
+        rel = self.version_combo.currentData()
+        self._programs = []
+        self._render()
+        if rel and self.on_open_release:
+            self.on_open_release(rel)
+
+    def _kind(self, p) -> str:
+        """missing | installed | restart | update | newer | different | unknown"""
+        if self._device_files is None:
+            return "unknown"
+        size = self._device_files.get(p["file"])
+        if size is None:
+            return "missing"
+        if size == p["size"]:
+            if self._device_names and p["name"] not in self._device_names:
+                return "restart"
+            return "installed"
+        lib, card = _prog_version_key(p["version"]), _prog_version_key(self._device_versions.get(p["file"]))
+        if lib and card and lib > card:
+            return "update"
+        if lib and card and lib < card:
+            return "newer"
+        return "different"
+
+    def _status_for(self, p) -> tuple:
+        """(text, colour) for one library program vs the SD card."""
+        card_ver = self._device_versions.get(p["file"], "")
+        return {
+            "unknown":   ("\u2014", TEXT_DIM),
+            "missing":   ("Not installed", TEXT_DIM),
+            "installed": ("Installed", "#7ee787"),
+            "restart":   ("Installed \u00b7 restart to load", WARN),
+            "update":    (f"Update available (card has {card_ver})", WARN),
+            "newer":     (f"Card has newer {card_ver}", "#8ab4ff"),
+            "different": ("Different build", WARN),
+        }[self._kind(p)]
+
+    def _render(self):
+        self.tree.blockSignals(True)
+        self.tree.setSortingEnabled(False)
+        self.tree.clear()
+        for p in self._programs:
+            st, colour = self._status_for(p)
+            it = QTreeWidgetItem([p["name"], p["author"], p["version"], st])
+            it.setData(0, Qt.ItemDataRole.UserRole, p)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(0, Qt.CheckState.Unchecked)
+            it.setForeground(3, QColor(colour))
+            tip = p["description"] + (f"\nCategories: {', '.join(p['categories'])}" if p["categories"] else "")
+            for c in range(4):
+                it.setToolTip(c, tip)
+            self.tree.addTopLevelItem(it)
+        self.tree.setSortingEnabled(True)
+        self.tree.blockSignals(False)
+        self._render_banner()
+        self._update_buttons()
+
+    def _render_banner(self):
+        rel = self._release
+        dev, tgt = _fw_version_key(self._device_fw), _fw_version_key((rel or {}).get("target_fw", ""))
+        if rel and dev and tgt and tgt > dev:
+            self.banner.setText(
+                f"\u26a0  This library was built for firmware {rel['target_fw']}; your Videomancer "
+                f"runs {self._device_fw}. Programs built for newer firmware may not load. "
+                f"Update the firmware with LZX Connect first, or pick an older library version.")
+            self.banner.setStyleSheet(
+                f"color:#ffffff;background:#5a1f3a;border:1px solid {ERROR};border-radius:6px;"
+                f"padding:6px 8px;font-size:12px;")
+            self.banner.setVisible(True)
+        elif rel and not rel.get("verified", True):
+            self.banner.setText("This release has no published checksum, so the download can't be verified.")
+            self.banner.setStyleSheet(f"color:{WARN};font-size:12px;background:transparent;border:none;")
+            self.banner.setVisible(True)
+        else:
+            self.banner.setVisible(False)
+
+    def _on_current(self, item, _prev):
+        p = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not p:
+            self.desc.setText("")
+            return
+        cats = f"   [{', '.join(p['categories'])}]" if p["categories"] else ""
+        self.desc.setText(f"{p['description']}{cats}")
+
+    def _checked(self) -> list:
+        out = []
+        for i in range(self.tree.topLevelItemCount()):
+            it = self.tree.topLevelItem(i)
+            if it.checkState(0) == Qt.CheckState.Checked:
+                out.append(it.data(0, Qt.ItemDataRole.UserRole))
+        return out
+
+    def _check_all(self, on: bool, only_missing: bool = False):
+        self.tree.blockSignals(True)
+        for i in range(self.tree.topLevelItemCount()):
+            it = self.tree.topLevelItem(i)
+            p = it.data(0, Qt.ItemDataRole.UserRole)
+            want = on and (not only_missing or self._kind(p) == "missing")
+            it.setCheckState(0, Qt.CheckState.Checked if want else Qt.CheckState.Unchecked)
+        self.tree.blockSignals(False)
+        self._update_buttons()
+
+    def _select_missing(self):
+        self._check_all(True, only_missing=True)
+
+    def _updatable(self) -> list:
+        return [p for p in self._programs if self._kind(p) in ("update", "different")]
+
+    def _update_all(self):
+        todo = self._updatable()
+        if not todo:
+            return
+        self.tree.blockSignals(True)
+        for i in range(self.tree.topLevelItemCount()):
+            it = self.tree.topLevelItem(i)
+            on = it.data(0, Qt.ItemDataRole.UserRole) in todo
+            it.setCheckState(0, Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+        self.tree.blockSignals(False)
+        self._install_checked()
+
+    def _update_buttons(self):
+        checked = self._checked() if hasattr(self, "tree") else []
+        can_device = self._connected and not self._busy and self._device_files is not None
+        self.install_btn.setEnabled(can_device and bool(checked))
+        self.install_btn.setText(f"\u2B07  INSTALL {len(checked)}" if checked else "\u2B07  INSTALL")
+        on_card = [p for p in checked if self._device_files and p["file"] in self._device_files]
+        self.remove_btn.setEnabled(can_device and bool(on_card))
+        n_upd = len(self._updatable()) if self._programs else 0
+        self.update_all_btn.setEnabled(can_device and n_upd > 0)
+        self.update_all_btn.setText(f"\u21bb  Update all ({n_upd})" if n_upd else "\u21bb  Update all")
+        self.add_file_btn.setEnabled(can_device)
+        for b in (self.sel_all_btn, self.sel_none_btn):
+            b.setEnabled(bool(self._programs) and not self._busy)
+
+    def _install_checked(self):
+        progs = self._checked()
+        if not progs or not self.on_install:
+            return
+        rel = self._release or {}
+        dev, tgt = _fw_version_key(self._device_fw), _fw_version_key(rel.get("target_fw", ""))
+        if dev and tgt and tgt > dev:
+            if not _VMConfirmDialog.ask(
+                self, "Newer firmware required?",
+                f"This library was built for firmware <b>{rel['target_fw']}</b> and your "
+                f"Videomancer runs <b>{self._device_fw}</b>.<br><br>Programs built for newer "
+                f"firmware may fail to load — the device keeps the previous program.<br><br>"
+                f"Install anyway?"):
+                return
+        older = [p for p in progs if self._kind(p) == "newer"]
+        if older and not _VMConfirmDialog.ask(
+                self, "Replace with an older version?",
+                "The card already has a <b>newer</b> version of:<br><br>"
+                + "<br>".join(f"{p['name']} — card {self._device_versions.get(p['file'], '?')}, "
+                              f"this library {p['version']}" for p in older[:8])
+                + ("<br>\u2026" if len(older) > 8 else "")
+                + "<br><br>Installing replaces them with the older version. Continue?"):
+            return
+        total_kb = sum(p["size"] for p in progs) // 1024
+        if not _VMConfirmDialog.ask(
+            self, "Install Programs",
+            f"Copy <b>{len(progs)}</b> program{'s' if len(progs) != 1 else ''} "
+            f"({total_kb:,} KB) to the Videomancer's SD card?<br><br>"
+            f"Controls pause during the copy (about {max(1, total_kb // 150)} s). "
+            f"Power-cycle the Videomancer afterwards to load them."):
+            return
+        self.on_install(rel, progs)
+
+    def _remove_checked(self):
+        progs = [p for p in self._checked() if self._device_files and p["file"] in self._device_files]
+        if not progs or not self.on_remove:
+            return
+        names = ", ".join(p["name"] for p in progs[:6]) + (" \u2026" if len(progs) > 6 else "")
+        if not _VMConfirmDialog.ask(
+            self, "Remove Programs",
+            f"Delete {len(progs)} program{'s' if len(progs) != 1 else ''} from the SD card?"
+            f"<br><br>{names}<br><br>You can reinstall them from the library later."):
+            return
+        self.on_remove(progs)
+
+    def _pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Install a Videomancer program", str(Path.home()),
+            "Videomancer programs (*.vmprog)")
+        if path and self.on_add_file:
+            self.on_add_file(path)
+
+
 class VideomancerApp(QMainWindow):
 
     def __init__(self, window_number: int = 1):
@@ -5408,6 +6025,16 @@ class VideomancerApp(QMainWindow):
                 else "Load timed out — device didn't confirm"))
         self._pending_load_error = ""
         self._last_load_request = ("", 0.0)   # (program, monotonic) we asked for
+        # Program library: one `fs` command in flight at a time; polling
+        # pauses while the library owns the link (installs, card scans).
+        self._library_busy = False
+        self._fs_queue = []            # [(command, callback)]
+        self._fs_current = None
+        self._fs_watchdog = QTimer(self)
+        self._fs_watchdog.setSingleShot(True)
+        self._fs_watchdog.timeout.connect(lambda: self._fs_reply(None))
+        self._lib_releases = {}
+        self._lib_threads = set()
 
         self._setup_ui()
 
@@ -5476,6 +6103,7 @@ class VideomancerApp(QMainWindow):
         self.param_tab   = ParametersTab()
         self.system_tab  = SystemTab()
         self.state_tab   = StateTab()
+        self.library_tab = LibraryTab()
         self.snap_tab    = SnapshotsTab()   # keep for snapshot callbacks
 
         # Each tab scrolls when the window is smaller than its layout, so the
@@ -5494,14 +6122,22 @@ class VideomancerApp(QMainWindow):
         self.tabs.addTab(_scrollable(self.param_tab),  "CONTROL")
         self.tabs.addTab(_scrollable(self.system_tab), "SYSTEM")
         self.tabs.addTab(_scrollable(self.state_tab),  "STATE")
+        self.tabs.addTab(self.library_tab,               "LIBRARY")
         widest = max(t.minimumSizeHint().width() for t in
-                     (self.prog_tab, self.param_tab, self.system_tab, self.state_tab))
+                     (self.prog_tab, self.param_tab, self.system_tab, self.state_tab,
+                      self.library_tab))
         self.setMinimumWidth(widest + 100)  # tab frame, margins, vertical scrollbar
         # Default size: wide enough for every tab, no taller than the screen
         scr = QApplication.primaryScreen()
         avail_h = scr.availableGeometry().height() - 40 if scr else 1020
         self.resize(max(self.width(), self.minimumWidth()), min(self.height(), avail_h))
         self._install_shortcuts()
+        self.library_tab.on_refresh = lambda: self._lib_refresh(force=True)
+        self.system_tab.on_open_library = lambda: self.tabs.setCurrentIndex(4)
+        self.library_tab.on_open_release = self._lib_open_release
+        self.library_tab.on_install = self._lib_install
+        self.library_tab.on_remove = self._lib_remove
+        self.library_tab.on_add_file = self._lib_add_file
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.conn_bar.data_refresh_btn.clicked.connect(self._on_tab_refresh)
 
@@ -5922,6 +6558,8 @@ fi
         self._worker.connected.connect(self._on_connected)
         self._worker.disconnected.connect(self._on_disconnected)
         self._worker.response.connect(self._on_response)
+        self._worker.put_progress.connect(self._lib_put_progress)
+        self._worker.put_finished.connect(self._lib_put_finished)
         self._worker.error.connect(self._on_error)
         self._worker.programs_page.connect(self._on_programs_page)
         self._worker.status_update.connect(self._on_status_update)
@@ -5941,6 +6579,7 @@ fi
         _claimed_ports.add(port)
         self._claimed_port = port
         self.conn_bar.set_connected(port)
+        self.library_tab.set_connected(True)
         self.prog_tab.set_connected(True)
         self.param_tab.set_connected(True)
         self.system_tab.set_connected(True)
@@ -5963,6 +6602,15 @@ fi
 
     @pyqtSlot()
     def _on_disconnected(self):
+        self._fs_queue.clear()
+        self._fs_watchdog.stop()
+        if self._fs_current is not None:
+            _cmd, cb = self._fs_current
+            self._fs_current = None
+            cb(None)
+        self._library_busy = False
+        self.library_tab.set_connected(False)
+        self.library_tab.set_busy(False)
         # Remember the port for auto-reconnect
         last_port = getattr(self, '_claimed_port', None)
         # Release claimed port
@@ -6062,6 +6710,12 @@ fi
             self.system_tab.apply_msd_response(prefix, payload)
             return
 
+        if prefix == "error" and self._fs_current is not None:
+            # While the library runs, `fs` commands are the only traffic, so an
+            # error answers the command in flight.
+            self._fs_reply({"error": f"{key}: {payload}".strip(": ")})
+            return
+
         if prefix == "error" and self._pending_load:
             # Errors carry a numeric code, not the command that caused them, so
             # we can't tell a rejected load from a poll that failed while the
@@ -6075,7 +6729,14 @@ fi
         if key == "version":
             self._sb_fw.setText(f"FW: {payload}")
             self.system_tab.apply_firmware_info(version=payload.strip())
+            self.library_tab.set_device_firmware(payload.strip())
             self._maybe_announce_firmware()
+
+        elif key == "fs" and self._fs_current is not None and '"put"' not in payload:
+            try:
+                self._fs_reply(json.loads(payload))
+            except Exception:
+                self._fs_reply({"raw": payload})
 
         elif key in ("cpu", "ram", "fpga", "fs"):
             try:
@@ -6446,7 +7107,7 @@ fi
         """Poll device state for bidirectional sync every 250ms.
         Skip modulation polling while user is editing to prioritize sends."""
         try:
-            if not self._worker:
+            if not self._worker or self._library_busy:
                 return
             # Keep polling modulation status while the user edits: readback
             # is filtered per channel, so other knobs (and hardware moves)
@@ -6800,6 +7461,393 @@ fi
             sc.activated.connect(fn)
             self._shortcuts.append(sc)
 
+    # ------------------------------------------------------------------
+    # Program library
+    # ------------------------------------------------------------------
+
+    def _fs(self, cmd: str, cb, timeout_ms: int = 10000):
+        """Queue one `fs …` command; cb(reply_dict_or_None) runs on its reply."""
+        self._fs_queue.append((cmd, cb, timeout_ms))
+        self._fs_next()
+
+    def _fs_next(self):
+        if self._fs_current is not None or not self._fs_queue or not self._worker:
+            return
+        cmd, cb, timeout_ms = self._fs_queue.pop(0)
+        self._fs_current = (cmd, cb)
+        self._worker.send(cmd)
+        self._fs_watchdog.start(timeout_ms)
+
+    def _fs_reply(self, data):
+        if self._fs_current is None:
+            return
+        self._fs_watchdog.stop()
+        _cmd, cb = self._fs_current
+        self._fs_current = None
+        try:
+            cb(data)
+        finally:
+            self._fs_next()
+
+    def _lib_set_busy(self, busy: bool, msg: str = ""):
+        self._library_busy = busy
+        self.library_tab.set_busy(busy, msg)
+        if busy:
+            self._pending_cmds.clear()
+
+    def _lib_refresh(self, force: bool = False):
+        """Show cached releases instantly, refresh them from GitHub in the
+        background, and rescan the card unless it was scanned very recently."""
+        if not self._lib_releases:
+            try:
+                cached = json.loads(_app_settings().value("library/releases", "") or "{}")
+            except Exception:
+                cached = {}
+            if cached:
+                self._lib_on_releases(cached, from_cache=True)
+            else:
+                self.library_tab.status.setText("Loading library releases from GitHub\u2026")
+        stale = time.monotonic() - getattr(self, "_lib_fetched_at", -1e9) > 600
+        if force or stale:
+            t = _LibraryIndexFetcher()
+            t.releases_ready.connect(self._lib_on_releases)
+            t.failed.connect(lambda m: None if self._lib_releases
+                             else self.library_tab.status.setText(m))
+            self._lib_track(t)
+            t.start()
+        if force or time.monotonic() - getattr(self, "_lib_scanned_at", -1e9) > 60:
+            self._lib_scan_device()
+
+    def _lib_track(self, t):
+        self._lib_threads.add(t)
+        t.finished.connect(lambda t=t: self._lib_threads.discard(t))
+
+    def _lib_on_releases(self, releases: dict, from_cache: bool = False):
+        if not from_cache:
+            self._lib_fetched_at = time.monotonic()
+            _app_settings().setValue("library/releases", json.dumps(releases))
+            if releases == self._lib_releases:
+                return            # nothing new — keep the current view
+        self._lib_releases = releases
+        self.library_tab.set_device_firmware(self.system_tab._device_fw)
+        self.library_tab.set_releases(releases)
+
+    def _lib_open_release(self, rel: dict):
+        self.library_tab.status.setText(f"Downloading library {rel['version']}\u2026")
+        t = _LibraryDownloader(rel)
+        t.progress.connect(lambda d, n: self.library_tab.set_progress(d, n or d))
+        t.done.connect(self._lib_on_release_ready)
+        t.failed.connect(lambda m: (self.library_tab.status.setText(m),
+                                    self.library_tab.progress.setVisible(False)))
+        self._lib_track(t)
+        t.start()
+
+    def _lib_on_release_ready(self, rel: dict, programs: list):
+        if self.library_tab.version_combo.currentData() and \
+                self.library_tab.version_combo.currentData().get("tag") != rel.get("tag"):
+            return   # user picked another version meanwhile
+        self._lib_release = rel
+        self.library_tab.progress.setVisible(False)
+        self.library_tab.set_programs(rel, programs)
+        self.library_tab.status.setText(
+            f"{len(programs)} programs in {rel['version']}"
+            + ("  \u00b7  checksum verified" if rel.get("verified") else "")
+            + ".  New programs appear after you power-cycle the Videomancer.")
+
+    def _lib_scan_device(self, then=None):
+        """List sd:/programs/<vendor>/*.vmprog with sizes."""
+        if not self._worker:
+            self.library_tab.set_device_programs(None, [])
+            return
+        self._lib_set_busy(True, "Reading the SD card\u2026")
+        files = {}
+
+        def entries_of(d):
+            if isinstance(d, dict):
+                return d.get("entries") or [], bool(d.get("more")), d.get("next")
+            return (d if isinstance(d, list) else []), False, None
+
+        def is_dir(e):
+            t = str(e.get("type", "")).lower()
+            return bool(e.get("dir") or e.get("is_dir") or t in ("dir", "directory", "d"))
+
+        def listdir(path, done, offset=0, acc=None):
+            acc = {} if acc is None else acc
+            cmd = f"fs ls {path}" + (f" {offset}" if offset else "")
+
+            def got(d):
+                if d is None or (isinstance(d, dict) and "error" in d):
+                    return done(acc, d)
+                page, more, nxt = entries_of(d)
+                for e in page:
+                    if isinstance(e, dict) and e.get("name"):
+                        acc.setdefault(e["name"], e)   # last entry repeats — dedupe
+                if more and isinstance(nxt, int) and nxt > offset:
+                    listdir(path, done, nxt, acc)
+                else:
+                    done(acc, None)
+            self._fs(cmd, got)
+
+        vendors = []
+
+        def root_done(acc, err):
+            if err is not None:
+                return finish(err)
+            vendors.extend(n for n, e in acc.items() if is_dir(e))
+            next_vendor()
+
+        def next_vendor():
+            if not vendors:
+                return finish(None)
+            v = vendors.pop(0)
+
+            def vdone(acc, err):
+                for n, e in acc.items():
+                    if n.endswith(".vmprog") and not is_dir(e):
+                        files[f"{v}/{n}"] = int(e.get("size", -1))
+                next_vendor()
+            listdir(f"{SD_PROGRAMS}/{v}", vdone)
+
+        def finish(err):
+            if err is not None and "error" in (err or {}):
+                self._lib_set_busy(False)
+                self.library_tab.set_device_programs({}, list(self.prog_tab._all))
+                self.library_tab.status.setText(
+                    "No program folder on the SD card yet." if "not" in str(err).lower()
+                    else f"Couldn't read the SD card ({err.get('error')}).")
+                self._lib_scanned_at = time.monotonic()
+                if then:
+                    then()
+                return
+
+            def got_manifest(man, missing):
+                versions = {e.get("file"): e.get("program_version", "")
+                            for e in ((man or {}).get("programs") or []) if isinstance(e, dict)}
+                self._lib_set_busy(False)
+                self._lib_scanned_at = time.monotonic()
+                self.library_tab.set_device_programs(files, list(self.prog_tab._all), versions)
+                self.library_tab.status.setText(
+                    f"{len(files)} programs on the SD card.  "
+                    "New programs appear after you power-cycle the Videomancer.")
+                if then:
+                    then()
+            self._lib_read_manifest(got_manifest)
+
+        listdir(SD_PROGRAMS, root_done)
+
+    # -- install / remove -------------------------------------------------
+
+    def _lib_install(self, rel: dict, programs: list, file_blobs: Optional[dict] = None):
+        """mkdir vendor folders → fs put each file → fs stat to confirm size
+        → merge the SD manifest → rescan."""
+        import zipfile
+        if not self._worker:
+            return
+        blobs = dict(file_blobs or {})
+        if not file_blobs:
+            try:
+                with zipfile.ZipFile(rel["zip_path"]) as z:
+                    for p in programs:
+                        blobs[p["file"]] = z.read(p["zip_member"])
+            except Exception as exc:
+                self.library_tab.status.setText(f"Couldn't read the library zip: {exc}")
+                return
+        total = sum(len(b) for b in blobs.values())
+        replaced = sum(max(0, (self.library_tab._device_files or {}).get(p["file"], 0))
+                       for p in programs)
+        need = total - replaced + 64 * 1024          # + manifest and headroom
+        self._lib_set_busy(True, "Checking free space on the SD card\u2026")
+
+        def got_info(d):
+            free = d.get("free") if isinstance(d, dict) else None
+            if isinstance(free, (int, float)) and need > free:
+                self._lib_set_busy(False)
+                _VMConfirmDialog.notify(
+                    self, "Not enough space",
+                    f"These programs need about {need / 1e6:.1f} MB but the SD card has "
+                    f"{free / 1e6:.1f} MB free. Remove some programs first.")
+                return
+            self._lib_begin_install(rel, programs, blobs, total)
+        self._fs("fs info", got_info)
+
+    def _lib_begin_install(self, rel, programs, blobs, total):
+        self._lib_set_busy(True, f"Installing {len(programs)} program(s)\u2026")
+        self._lib_job = {"programs": list(programs), "blobs": blobs, "done_bytes": 0,
+                         "total": total, "ok": [], "failed": [], "rel": rel}
+        vendors = sorted({p["file"].split("/")[0] for p in programs})
+        self._fs(f"fs mkdir {SD_PROGRAMS}", lambda _d: None)      # exists → error, fine
+        for v in vendors:
+            self._fs(f"fs mkdir {SD_PROGRAMS}/{v}", lambda _d: None)
+        self._fs("fs caps", lambda _d: self._lib_put_next())      # barrier after mkdirs
+
+    def _lib_put_next(self):
+        job = getattr(self, "_lib_job", None)
+        if job is None:
+            return
+        if not job["programs"]:
+            return self._lib_update_manifest(job)
+        p = job["programs"][0]
+        self.library_tab.set_progress(job["done_bytes"], job["total"],
+                                      f"Copying {p['name']}\u2026")
+        self._worker.put_file(p["sd_path"], job["blobs"][p["file"]])
+
+    def _lib_put_progress(self, path: str, sent: int, total: int):
+        job = getattr(self, "_lib_job", None)
+        if job:
+            self.library_tab.set_progress(job["done_bytes"] + sent, job["total"])
+
+    def _lib_put_finished(self, path: str, ok: bool, msg: str):
+        mjob = getattr(self, "_lib_manifest_job", None)
+        if mjob is not None and path.endswith("/manifest.json"):
+            return self._lib_finish(mjob, "" if ok else "program index not updated")
+        job = getattr(self, "_lib_job", None)
+        if job is None:
+            return
+        p = job["programs"].pop(0)
+        job["done_bytes"] += p["size"]
+
+        def verified(d):
+            size = (d or {}).get("size") if isinstance(d, dict) else None
+            if ok and size is not None and int(size) == p["size"]:
+                job["ok"].append(p)
+            else:
+                job["failed"].append((p, msg if not ok else f"size on card {size}, expected {p['size']}"))
+            self._lib_put_next()
+        if ok:
+            self._fs(f"fs stat {p['sd_path']}", verified)
+        else:
+            verified(None)
+
+    def _lib_read_manifest(self, done):
+        """Read sd:/programs/manifest.json via chunked base64 `fs read`."""
+        import base64
+        path = f"{SD_PROGRAMS}/manifest.json"
+
+        def got_stat(d):
+            if not isinstance(d, dict) or "error" in d or "size" not in d:
+                return done(None, missing=True)
+            size, buf = int(d["size"]), bytearray()
+
+            def read_more(_=None):
+                if len(buf) >= size:
+                    try:
+                        return done(json.loads(buf.decode("utf-8")), missing=False)
+                    except Exception:
+                        return done(None, missing=False)
+                n = min(180, size - len(buf))      # 256-byte base64 cap per reply
+
+                def got(r):
+                    data = base64.b64decode((r or {}).get("data", "")) if isinstance(r, dict) else b""
+                    if not data:
+                        return done(None, missing=False)
+                    buf.extend(data)
+                    read_more()
+                self._fs(f"fs read {path} {len(buf)} {n}", got)
+            read_more()
+        self._fs(f"fs stat {path}", got_stat)
+
+    def _lib_update_manifest(self, job, removed: Optional[list] = None):
+        """Merge installed/removed programs into sd:/programs/manifest.json so
+        the card's own index describes them (the official zip ships one)."""
+        rel = job.get("rel") or {}
+
+        def merged(existing, missing):
+            if existing is None and not missing:
+                # Present but unreadable: leave it alone rather than clobber it.
+                return self._lib_finish(job, "manifest unreadable — left unchanged")
+            man = existing or {"format_version": "1.0", "product": "videomancer", "programs": []}
+            rows = {e.get("file"): e for e in man.get("programs", []) if isinstance(e, dict)}
+            for p in job["ok"]:
+                rows[p["file"]] = p.get("manifest_entry") or {
+                    "name": Path(p["file"]).stem, "program_id": p["program_id"],
+                    "program_name": p["name"], "program_version": p["version"],
+                    "categories": p["categories"], "program_type": "processing",
+                    "description": p["description"], "author": p["author"], "file": p["file"]}
+            for p in removed or []:
+                rows.pop(p["file"], None)
+            man["programs"] = sorted(rows.values(), key=lambda e: str(e.get("file")))
+            data = json.dumps(man, indent=2).encode()
+            self._lib_manifest_job = job
+            self._worker.put_file(f"{SD_PROGRAMS}/manifest.json", data)
+        if not job["ok"] and not removed:
+            return self._lib_finish(job, "")
+        self.library_tab.set_progress(job["total"], job["total"], "Updating the card's program index\u2026")
+        self._lib_job = None
+        self._lib_read_manifest(merged)
+
+    def _lib_finish(self, job, note: str):
+        self._lib_job = None
+        self._lib_manifest_job = None
+        ok, failed = job["ok"], job["failed"]
+        removed = job.get("removed", [])
+
+        def after_scan():
+            if removed:
+                msg = f"Removed {len(removed)} program(s)."
+            else:
+                msg = f"Installed {len(ok)} program(s)."
+            if failed:
+                msg += f"  {len(failed)} failed: " + ", ".join(p["name"] for p, _ in failed[:4])
+            if note:
+                msg += f"  ({note})"
+            msg += "  Power-cycle the Videomancer to load the changes."
+            self.library_tab.status.setText(msg)
+            self.library_tab.progress.setVisible(False)
+            if ok or removed:
+                _VMConfirmDialog.notify(
+                    self, "Restart your Videomancer",
+                    msg + "\n\nThe Videomancer reads its program list when it starts, so "
+                    "turn it off and on again. The app reconnects automatically.")
+        self._lib_set_busy(False)
+        self._lib_scan_device(then=after_scan)
+
+    def _lib_remove(self, programs: list):
+        if not self._worker:
+            return
+        self._lib_set_busy(True, f"Removing {len(programs)} program(s)\u2026")
+        job = {"programs": [], "ok": [], "failed": [], "removed": [], "total": 1, "rel": None}
+        pending = list(programs)
+
+        def next_rm(_=None):
+            if not pending:
+                return self._lib_update_manifest(job, removed=job["removed"]) \
+                    if job["removed"] else self._lib_finish(job, "")
+            p = pending.pop(0)
+
+            def got(d):
+                if isinstance(d, dict) and "error" in d:
+                    job["failed"].append((p, d["error"]))
+                else:
+                    job["removed"].append(p)
+                next_rm()
+            self._fs(f"fs rm {p['sd_path']}", got)
+        next_rm()
+
+    def _lib_add_file(self, path: str):
+        try:
+            data = Path(path).read_bytes()
+        except OSError as exc:
+            return _VMConfirmDialog.notify(self, "Can't read file", str(exc))
+        info = _vmprog_info(data)
+        if not info:
+            return _VMConfirmDialog.notify(
+                self, "Not a Videomancer program",
+                f"{Path(path).name} isn't a valid .vmprog file.")
+        parts = info["program_id"].split(".")
+        vendor = re.sub(r"[^a-z0-9_-]", "", (parts[1] if len(parts) >= 3 else "user").lower()) or "user"
+        fname = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(path).name)
+        prog = {"file": f"{vendor}/{fname}", "size": len(data),
+                "sd_path": f"{SD_PROGRAMS}/{vendor}/{fname}", "name": info["name"] or Path(path).stem,
+                "author": info["author"], "version": info["version"],
+                "description": info["description"], "categories": [],
+                "program_id": info["program_id"], "manifest_entry": None}
+        if not _VMConfirmDialog.ask(
+                self, "Install Program",
+                f"Install <b>{prog['name']}</b> {prog['version']} by {prog['author'] or 'unknown'} "
+                f"to <code>{prog['sd_path']}</code>?"):
+            return
+        self._lib_install({}, [prog], file_blobs={prog["file"]: data})
+
     def _on_latest_firmware(self, latest: str):
         self.system_tab.set_latest_firmware(latest)
         self._maybe_announce_firmware()
@@ -6813,7 +7861,7 @@ fi
                 f"System tab \u2192 Update with LZX Connect", 10000)
 
     def _poll_health(self):
-        if self._worker and self.tabs.currentIndex() == 2:
+        if self._worker and self.tabs.currentIndex() == 2 and not self._library_busy:
             for cmd in ("cpu", "ram", "fpga status", "fs info"):
                 self._worker.send(cmd)
         else:
@@ -6822,6 +7870,8 @@ fi
     def _on_tab_changed(self, idx: int):
         if idx != 2:
             self._health_timer.stop()
+        if idx == 4 and not self._worker and not self._lib_releases:
+            self._lib_refresh()          # browse the library even when offline
         if not self._worker:
             return
         if idx == 1:   # Motion
@@ -6836,6 +7886,8 @@ fi
         elif idx == 3: # State
             self._fetch_presets()
             self.state_tab._reload_snapshots()
+        elif idx == 4 and not self._library_busy:  # Library
+            self._lib_refresh()
 
     def _on_tab_refresh(self):
         """Refresh action for current tab."""
