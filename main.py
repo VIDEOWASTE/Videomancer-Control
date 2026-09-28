@@ -363,8 +363,7 @@ class _UpdateDownloader(QThread):
     @staticmethod
     def asset_name_for_platform() -> Optional[str]:
         if sys.platform == "darwin":
-            # Universal2 build since 2.6. Releases still publish a
-            # `_macOS_Intel.zip` copy so installs <= 2.5 can update.
+            # Universal2 build (Apple Silicon + Intel) since 2.6.
             return "VideomancerControl_macOS.zip"
         if sys.platform.startswith("win"):
             return "VideomancerControl_Windows.zip"

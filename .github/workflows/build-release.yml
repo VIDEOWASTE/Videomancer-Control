@@ -150,13 +150,13 @@ jobs:
             --timeout 30m
           xcrun stapler staple VideomancerControl_macOS.dmg
 
-      - name: Create zips for the in-app updater
+      - name: Create zip for the in-app updater
         run: |
-          # Older versions (<= 2.5) look for these two names. Both now hold
-          # the same universal app, so every existing install can update.
+          # The in-app updater (2.6+) downloads this; it holds the same
+          # universal app as the DMG. (No separate Intel asset: the pre-2.6
+          # updaters that looked for one never worked.)
           cd dist
           ditto -c -k --keepParent "Videomancer Control.app" ../VideomancerControl_macOS.zip
-          cp ../VideomancerControl_macOS.zip ../VideomancerControl_macOS_Intel.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -165,7 +165,6 @@ jobs:
           path: |
             VideomancerControl_macOS.dmg
             VideomancerControl_macOS.zip
-            VideomancerControl_macOS_Intel.zip
 
 
   build-windows:
@@ -248,7 +247,6 @@ jobs:
           files: |
             VideomancerControl_macOS.dmg
             VideomancerControl_macOS.zip
-            VideomancerControl_macOS_Intel.zip
             VideomancerControl_Windows.zip
           draft: false
           prerelease: false
