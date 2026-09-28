@@ -5791,6 +5791,11 @@ class LibraryTab(QWidget):
         self._device_fw = fw or ""
         self._render_banner()
 
+    def set_device_names(self, names):
+        self._device_names = set(names or [])
+        if self._programs:
+            self._render()
+
     def set_device_programs(self, files, names, versions=None):
         self._device_files = dict(files) if files is not None else None
         self._device_names = set(names or [])
@@ -5884,7 +5889,8 @@ class LibraryTab(QWidget):
         if size is None:
             return "missing"
         if size == p["size"]:
-            if self._device_names and p["name"] not in self._device_names:
+            loaded = {n.casefold() for n in self._device_names}
+            if loaded and p["name"].casefold() not in loaded:
                 return "restart"
             return "installed"
         card_ver = self._device_versions.get(cp) or self._device_versions.get(p["file"])
@@ -6670,6 +6676,7 @@ fi
         self._claimed_port = port
         self.conn_bar.set_connected(port)
         self.library_tab.set_connected(True)
+        self._lib_scan_on_boot = True    # scan the card once the program list is in
         self.prog_tab.set_connected(True)
         self.param_tab.set_connected(True)
         self.system_tab.set_connected(True)
@@ -7117,6 +7124,15 @@ fi
             self._worker.list_programs(nxt)
         else:
             self.status_bar.showMessage(f"{total} programs", 3000)
+            # The device's program list is what "loaded" means for the
+            # Library tab; refresh it every time the list is re-read.
+            self.library_tab.set_device_names(self.prog_tab._all)
+            if getattr(self, "_lib_scan_on_boot", False):
+                # Fresh connection (app start or the Videomancer rebooted):
+                # read the SD card so the Library tab is current.
+                self._lib_scan_on_boot = False
+                QTimer.singleShot(1500, lambda: self._worker and not self._library_busy
+                                  and self._lib_scan_device())
 
     def load_program(self, name: str):
         if not self._worker:
