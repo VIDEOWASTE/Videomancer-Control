@@ -128,6 +128,16 @@ LIBRARY_SOURCES = [
      "repo": "lzxindustries/videomancer-community-programs", "tag_prefix": ""},
 ]
 SD_PROGRAMS = "sd:/programs"
+# How many SD programs the Videomancer loads at boot. rc.55 reported
+# "93 programs read, 23 over limit"; extra files are skipped.
+SD_PROGRAM_LIMIT = 70
+
+
+def _norm_prog_name(s: str) -> str:
+    """'temporal_diff_v1.0.0' / 'Temporal Diff' → 'temporaldiff' for matching
+    card file names against the device's display names."""
+    s = re.sub(r"(?i)[_-]?v?\d+(\.\d+){1,2}$", "", s.rsplit("/", 1)[-1].replace(".vmprog", ""))
+    return re.sub(r"[^a-z0-9]", "", s.casefold())
 
 
 def _library_cache_dir() -> Path:
@@ -5680,7 +5690,7 @@ class LibraryTab(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
         self._src_btns = {}
-        for src in LIBRARY_SOURCES:
+        for src in LIBRARY_SOURCES + [{"key": "card", "label": "ON THIS CARD"}]:
             b = QPushButton(src["label"])
             b.setCheckable(True)
             b.setChecked(src["key"] == self._source)
@@ -5694,6 +5704,7 @@ class LibraryTab(QWidget):
         top.addSpacing(10)
         ver_lbl = QLabel("Version")
         ver_lbl.setStyleSheet(note_css)
+        self.version_lbl = ver_lbl
         top.addWidget(ver_lbl)
         self.version_combo = QComboBox()
         self.version_combo.setMinimumWidth(230)
@@ -5709,6 +5720,11 @@ class LibraryTab(QWidget):
         self.banner.setWordWrap(True)
         self.banner.setVisible(False)
         root.addWidget(self.banner)
+
+        self.capacity = QLabel("")
+        self.capacity.setWordWrap(True)
+        self.capacity.setVisible(False)
+        root.addWidget(self.capacity)
 
         # Program list
         self.tree = QTreeWidget()
@@ -5796,14 +5812,69 @@ class LibraryTab(QWidget):
         if self._programs:
             self._render()
 
-    def set_device_programs(self, files, names, versions=None):
+    def set_device_programs(self, files, names, versions=None, card_names=None):
         self._device_files = dict(files) if files is not None else None
         self._device_names = set(names or [])
         self._device_versions = dict(versions or {})   # file → version (card manifest)
+        self._card_names = dict(card_names or {})      # file → display name (card manifest)
+        if self._source == "card":
+            self._programs = self._card_programs()
         self._render()
+
+    # ── ON THIS CARD view ──
+    def _loaded_norm(self) -> set:
+        return {_norm_prog_name(n) for n in self._device_names}
+
+    def _card_programs(self) -> list:
+        """Every .vmprog on the SD card, whatever its origin."""
+        out = []
+        known = {}
+        for rows in self._releases.values():
+            for r in rows:
+                known.setdefault(r["source"], r["version"])
+        for rel, size in sorted((self._device_files or {}).items()):
+            folder, _, base = rel.rpartition("/")
+            stem = re.sub(r"(?i)[_-]?v?\d+(\.\d+){1,2}$", "", base[:-7])
+            name = self._card_names.get(rel) or self._card_names.get(base) or \
+                stem.replace("_", " ").title()
+            out.append({"file": rel, "size": size, "sd_path": f"{SD_PROGRAMS}/{rel}",
+                        "name": name, "author": folder or "(loose)",
+                        "version": self._device_versions.get(rel, "") or "",
+                        "description": f"{SD_PROGRAMS}/{rel}  \u00b7  {size / 1024:.0f} KB",
+                        "categories": [], "program_id": "", "manifest_entry": None,
+                        "on_card": True})
+        return out
+
+    def _card_loaded(self, p) -> bool:
+        loaded = self._loaded_norm()
+        return bool(loaded) and (_norm_prog_name(p["name"]) in loaded
+                                 or _norm_prog_name(p["file"]) in loaded)
+
+    def _render_capacity(self):
+        n = len(self._device_files or {})
+        if self._device_files is None or not n:
+            self.capacity.setVisible(False)
+            return
+        over = n - SD_PROGRAM_LIMIT
+        if over > 0:
+            self.capacity.setText(
+                f"\u26a0  SD card: {n} programs \u2014 the Videomancer loads {SD_PROGRAM_LIMIT}, "
+                f"so {over} {'is' if over == 1 else 'are'} skipped at boot. "
+                f"Remove {over} to load them all "
+                f"(ON THIS CARD lists everything).")
+            self.capacity.setStyleSheet(
+                f"color:#ffffff;background:#5a1f3a;border:1px solid {ERROR};border-radius:6px;"
+                f"padding:6px 8px;font-size:12px;")
+        else:
+            self.capacity.setText(f"SD card: {n} of {SD_PROGRAM_LIMIT} program slots used.")
+            self.capacity.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;"
+                                        f"background:transparent;border:none;")
+        self.capacity.setVisible(True)
 
     def set_releases(self, releases: dict):
         self._releases = releases
+        if self._source == "card":
+            return          # stay on the card view; library lists fill in quietly
         self._fill_versions()
 
     def set_programs(self, release: dict, programs: list):
@@ -5832,7 +5903,17 @@ class LibraryTab(QWidget):
         self._source = key
         for k, b in self._src_btns.items():
             b.setChecked(k == key)
-        self._fill_versions()
+        card = key == "card"
+        self.version_combo.setVisible(not card)
+        self.version_lbl.setVisible(not card)
+        if card:
+            self._release = None
+            self._programs = self._card_programs()
+            self._render()
+            self.status.setText("Everything on the SD card. Remove programs you don't use to "
+                                "stay under the load limit.")
+        else:
+            self._fill_versions()
 
     def _fill_versions(self):
         rows = self._releases.get(self._source, [])
@@ -5871,6 +5952,8 @@ class LibraryTab(QWidget):
             return None
         if p["file"] in self._device_files:
             return p["file"]
+        if p.get("on_card"):
+            return None
         vendor, _, base = p["file"].rpartition("/")
         # Only LZX's own programs are matched by bare file name: the official
         # library ends up loose in programs/, while a loose file that shares a
@@ -5884,13 +5967,15 @@ class LibraryTab(QWidget):
         """missing | installed | restart | update | newer | different | unknown"""
         if self._device_files is None:
             return "unknown"
+        if p.get("on_card"):
+            return "loaded" if self._card_loaded(p) else "notloaded"
         cp = self.card_path(p)
         size = self._device_files.get(cp) if cp else None
         if size is None:
             return "missing"
         if size == p["size"]:
-            loaded = {n.casefold() for n in self._device_names}
-            if loaded and p["name"].casefold() not in loaded:
+            loaded = self._loaded_norm()
+            if loaded and _norm_prog_name(p["name"]) not in loaded:
                 return "restart"
             return "installed"
         card_ver = self._device_versions.get(cp) or self._device_versions.get(p["file"])
@@ -5909,7 +5994,13 @@ class LibraryTab(QWidget):
             "unknown":   ("\u2014", TEXT_DIM),
             "missing":   ("Not installed", TEXT_DIM),
             "installed": ("Installed", "#7ee787"),
-            "restart":   ("Installed \u00b7 restart to load", WARN),
+            "restart":   (("Not loaded \u00b7 over the card limit"
+                          if len(self._device_files or {}) > SD_PROGRAM_LIMIT
+                          else "Installed \u00b7 restart to load"), WARN),
+            "loaded":    ("Loaded", "#7ee787"),
+            "notloaded": (("Not loaded \u00b7 over the card limit"
+                           if len(self._device_files or {}) > SD_PROGRAM_LIMIT
+                           else "Not loaded"), ERROR),
             "update":    (f"Update available (card has {card_ver})", WARN),
             "newer":     (f"Card has newer {card_ver}", "#8ab4ff"),
             "different": ("Different build", WARN),
@@ -5932,7 +6023,11 @@ class LibraryTab(QWidget):
             self.tree.addTopLevelItem(it)
         self.tree.setSortingEnabled(True)
         self.tree.blockSignals(False)
+        card = self._source == "card"
+        self.tree.setHeaderLabels(["Program", "Location" if card else "Author", "Version",
+                                   "On your Videomancer"])
         self._render_banner()
+        self._render_capacity()
         self._update_buttons()
 
     def _render_banner(self):
@@ -6011,6 +6106,9 @@ class LibraryTab(QWidget):
         self.add_file_btn.setEnabled(can_device)
         for b in (self.sel_all_btn, self.sel_none_btn):
             b.setEnabled(bool(self._programs) and not self._busy)
+        card = self._source == "card"
+        for b in (self.install_btn, self.update_all_btn, self.sel_all_btn):
+            b.setVisible(not card)
 
     def _install_checked(self):
         progs = self._checked()
@@ -6034,6 +6132,15 @@ class LibraryTab(QWidget):
                               f"this library {p['version']}" for p in older[:8])
                 + ("<br>\u2026" if len(older) > 8 else "")
                 + "<br><br>Installing replaces them with the older version. Continue?"):
+            return
+        new = [p for p in progs if not self.card_path(p)]
+        after = len(self._device_files or {}) + len(new)
+        if new and after > SD_PROGRAM_LIMIT and not _VMConfirmDialog.ask(
+                self, "Over the program limit",
+                f"The Videomancer loads at most <b>{SD_PROGRAM_LIMIT}</b> programs from the SD "
+                f"card. After this install the card would hold <b>{after}</b>, so "
+                f"<b>{after - SD_PROGRAM_LIMIT}</b> won't load.<br><br>Remove programs first "
+                f"(ON THIS CARD lists everything), or install anyway?"):
             return
         total_kb = sum(p["size"] for p in progs) // 1024
         if not _VMConfirmDialog.ask(
@@ -7745,11 +7852,15 @@ fi
                 return
 
             def got_manifest(man, missing):
-                versions = {e.get("file"): e.get("program_version", "")
-                            for e in ((man or {}).get("programs") or []) if isinstance(e, dict)}
+                rows = [e for e in ((man or {}).get("programs") or []) if isinstance(e, dict)]
+                versions = {e.get("file"): e.get("program_version", "") for e in rows}
+                names = {}
+                for e in rows:                 # by manifest path and by bare file name
+                    f = str(e.get("file", ""))
+                    names[f] = names[f.rsplit("/", 1)[-1]] = e.get("program_name", "")
                 self._lib_set_busy(False)
                 self._lib_scanned_at = time.monotonic()
-                self.library_tab.set_device_programs(files, list(self.prog_tab._all), versions)
+                self.library_tab.set_device_programs(files, list(self.prog_tab._all), versions, names)
                 self.library_tab.status.setText(
                     f"{len(files)} programs on the SD card.  "
                     "New programs appear after you power-cycle the Videomancer.")
