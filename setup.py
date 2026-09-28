@@ -36,6 +36,7 @@ OPTIONS = {
     'packages': [
         'PyQt6',
         'serial',
+        'pythonosc',
     ],
     'includes': [
         'PyQt6.QtCore',

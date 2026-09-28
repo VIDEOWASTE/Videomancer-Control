@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           "$UPY" -m pip install --upgrade pip
-          "$UPY" -m pip install PyQt6 pyserial pyinstaller
+          "$UPY" -m pip install PyQt6 pyserial python-osc pyinstaller
 
       - name: Make Qt universal2
         run: |
@@ -44,6 +44,7 @@ jobs:
             --icon "icon.icns" \
             --target-architecture universal2 \
             --hidden-import serial.tools.list_ports \
+            --hidden-import pythonosc.osc_server \
             --collect-submodules PyQt6 \
             --add-data "fonts:fonts" \
             main.py
@@ -178,11 +179,11 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install PyQt6 pyserial pyinstaller
+        run: pip install PyQt6 pyserial python-osc pyinstaller
 
       - name: Build .exe
         run: |
-          pyinstaller --onefile --windowed --name "Videomancer Control" --icon "icon.ico" --hidden-import serial.tools.list_ports --add-data "fonts;fonts" main.py
+          pyinstaller --onefile --windowed --name "Videomancer Control" --icon "icon.ico" --hidden-import serial.tools.list_ports --hidden-import pythonosc.osc_server --add-data "fonts;fonts" main.py
 
       - name: Create zip
         run: |
@@ -241,7 +242,7 @@ jobs:
 
             ### Run from source
             ```
-            pip install PyQt6 pyserial
+            pip install PyQt6 pyserial python-osc
             python main.py
             ```
           files: |

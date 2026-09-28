@@ -25,6 +25,11 @@ if ! python3 -c "import serial" 2>/dev/null; then
     pip3 install pyserial
 fi
 
+if ! python3 -c "import pythonosc" 2>/dev/null; then
+    echo "  Installing python-osc..."
+    pip3 install python-osc
+fi
+
 if ! python3 -c "import py2app" 2>/dev/null; then
     echo "  Installing py2app..."
     pip3 install py2app

@@ -9,7 +9,7 @@ Tabs:
   Snapshots  – save/restore full device state as local JSON files
 
 Run:
-    pip3 install PyQt6 pyserial
+    pip3 install PyQt6 pyserial python-osc
     python3 main.py
 """
 
@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QTreeWidget, QTreeWidgetItem, QHeaderView,
 )
 import math
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QThread, QRectF, QPointF
+from PyQt6.QtCore import Qt, QTimer, pyqtSlot, pyqtSignal, QThread, QRectF, QPointF, QObject
 from PyQt6.QtGui import (QColor, QTextCharFormat, QTextCursor, QFont,
                           QPainter, QPen, QLinearGradient, QPainterPath)
 
@@ -1632,6 +1632,11 @@ class _StarDelegate(QStyledItemDelegate):
 
 def _app_settings():
     from PyQt6.QtCore import QSettings
+    # VMCTL_SETTINGS points tests (or a second profile) at a separate INI
+    # file so they never touch the user's real preferences.
+    alt = os.environ.get("VMCTL_SETTINGS")
+    if alt:
+        return QSettings(alt, QSettings.Format.IniFormat)
     return QSettings("VIDEOWASTE", "Videomancer Control")
 
 
@@ -5063,6 +5068,40 @@ class SystemTab(QWidget):
             self._midi_cells.append(cell)
         grid.addWidget(midi_grp, 2, 0, 1, 2)
 
+        # ·· OSC remote ··
+        osc_grp = QGroupBox("OSC REMOTE")
+        og = QVBoxLayout(osc_grp)
+        og.setSpacing(6)
+        orow = QHBoxLayout()
+        self.on_osc = None                   # (enabled, port) — set by the app
+        self.osc_btn = QPushButton("OFF")
+        self.osc_btn.setCheckable(True)
+        self.osc_btn.setFixedWidth(64)
+        self.osc_btn.clicked.connect(self._osc_changed)
+        orow.addWidget(self.osc_btn)
+        plbl = QLabel("Port")
+        plbl.setStyleSheet(LBL)
+        orow.addWidget(plbl)
+        from PyQt6.QtWidgets import QSpinBox
+        self.osc_port = QSpinBox()
+        self.osc_port.setRange(1024, 65535)
+        self.osc_port.setValue(_app_settings().value("osc/port", 9000, type=int))
+        self.osc_port.setFixedWidth(90)
+        self.osc_port.editingFinished.connect(
+            lambda: self.osc_btn.isChecked() and self._osc_changed())
+        orow.addWidget(self.osc_port)
+        self.osc_status = QLabel("Off")
+        self.osc_status.setStyleSheet(VAL)
+        self.osc_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        orow.addWidget(self.osc_status, stretch=1)
+        og.addLayout(orow)
+        self.osc_help = QLabel(OSC_HELP)
+        self.osc_help.setWordWrap(True)
+        self.osc_help.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.osc_help.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;{self._TRANSPARENT}")
+        og.addWidget(self.osc_help)
+        grid.addWidget(osc_grp, 3, 0, 1, 2)
+
         root.addLayout(grid)
 
         # ·· LZX resources: each link says what it's for ··
@@ -5239,6 +5278,30 @@ class SystemTab(QWidget):
         if version:
             self._device_fw = version
         self._refresh_fw_compare()
+
+    def _osc_changed(self):
+        on = self.osc_btn.isChecked()
+        if self.on_osc:
+            self.on_osc(on, self.osc_port.value())
+
+    def set_osc_state(self, listening: bool, port: int, error: str, last: str):
+        self.osc_btn.blockSignals(True)
+        self.osc_btn.setChecked(listening or bool(error))
+        self.osc_btn.blockSignals(False)
+        self.osc_btn.setText("ON" if listening else "OFF")
+        if error:
+            self.osc_status.setText(f"\u26a0 {error}")
+            self.osc_status.setStyleSheet(f"color:{ERROR};font-size:14px;font-weight:bold;"
+                                          f"{self._TRANSPARENT}")
+            return
+        self.osc_status.setStyleSheet(f"color:{TEXT};font-size:14px;font-weight:bold;"
+                                      f"{self._TRANSPARENT}")
+        if listening:
+            self.osc_port.setValue(port)
+            self.osc_status.setText(f"Listening on {_local_ip()}:{port}"
+                                    + (f"   \u00b7   last: {last}" if last else ""))
+        else:
+            self.osc_status.setText("Off \u2014 turn on to control the app over OSC")
 
     def _pick_theme(self, key: str):
         for k, b in self._theme_btns.items():
@@ -8157,6 +8220,54 @@ fi
             return
         self._lib_install({}, [prog], file_blobs={prog["file"]: data})
 
+    def _on_osc(self, addr: str, args: list):
+        """Route one OSC message. Trigger addresses ignore a 0 argument (a
+        TouchOSC-style button sends 1 on press and 0 on release)."""
+        a = addr.rstrip("/").lower()
+        if not a.startswith(OSC_PREFIX) or not self._worker:
+            return
+        a = a[len(OSC_PREFIX):]
+        val = args[0] if args else None
+        num = float(val) if isinstance(val, (int, float)) else None
+        released = num is not None and num == 0
+        pt = self.param_tab
+        if a == "/bpm" and num is not None:
+            bpm = max(20.0, min(300.0, num))
+            x100 = round(bpm * 100)
+            pt.set_bpm(bpm, x100)
+            self._queue_cmd("bpm", f"transport bpm {x100}")
+        elif a in ("/play", "/start") and not released:
+            self._send_transport("start")
+        elif a == "/stop" and not released:
+            self._send_transport("stop")
+        elif a == "/tap" and not released:
+            pt._transport("tap")
+        elif a.startswith("/param/") and num is not None:
+            try:
+                n = int(a.split("/")[2])
+            except (IndexError, ValueError):
+                return
+            if 1 <= n <= 12:
+                card = pt.channels[n - 1]
+                f = max(0.0, min(1.0, num))
+                v = (PARAM_RANGE if f >= 0.5 else 0) if card._is_toggle else round(f * PARAM_RANGE)
+                card.set_manual(v, silent=True)
+                pt._manual_changed(n - 1, v)
+        elif a == "/program" and isinstance(val, str):
+            match = next((p for p in self.prog_tab._all if p.casefold() == val.strip().casefold()), None)
+            if match and match != self._active_program:
+                self.load_program(match)
+        elif a in ("/program/next", "/program/prev") and not released:
+            names = self.prog_tab._all
+            if names:
+                i = names.index(self._active_program) if self._active_program in names else -1
+                i = (i + (1 if a.endswith("next") else -1)) % len(names)
+                self.load_program(names[i])
+        elif a == "/randomize" and not released:
+            pt.randomize()
+        elif a == "/undo" and not released:
+            pt.undo()
+
     def _on_latest_firmware(self, latest: str):
         self.system_tab.set_latest_firmware(latest)
         self._maybe_announce_firmware()
@@ -8262,6 +8373,102 @@ fi
 
 # ── Entry point ────────────────────────────────────────────────────────
 
+# ── OSC remote ─────────────────────────────────────────────────────────
+#
+# Anything that sends OSC (TouchOSC, Max, TouchDesigner, Resolume, Ableton
+# via Max for Live …) can drive the app. Messages arrive on a background
+# thread and are handed to the GUI thread through a Qt signal.
+
+OSC_PREFIX = "/videomancer"
+OSC_HELP = ("/videomancer/bpm 120  \u00b7  /play  \u00b7  /stop  \u00b7  /tap  \u00b7  "
+            "/param/1\u201312 0.0\u20131.0  \u00b7  /program \"Name\"  \u00b7  /program/next  "
+            "\u00b7  /program/prev  \u00b7  /randomize  \u00b7  /undo")
+
+
+class _OscBridge(QObject):
+    message = pyqtSignal(str, list)
+
+
+_OSC = {"server": None, "bridge": None, "port": 0, "error": "", "last": ""}
+
+
+def _local_ip() -> str:
+    """This computer's LAN address (no packets are sent)."""
+    import socket
+    try:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.connect(("10.255.255.255", 1))
+        ip = sk.getsockname()[0]
+        sk.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _osc_start(port: int) -> str:
+    """Start (or restart) the OSC listener on UDP `port`. '' or an error."""
+    _osc_stop()
+    try:
+        from pythonosc.dispatcher import Dispatcher
+        from pythonosc.osc_server import ThreadingOSCUDPServer
+    except ImportError:
+        _OSC["error"] = "python-osc isn't installed"
+        return _OSC["error"]
+    import threading
+    if _OSC["bridge"] is None:
+        _OSC["bridge"] = _OscBridge()
+        _OSC["bridge"].message.connect(_osc_dispatch)
+    d = Dispatcher()
+    d.set_default_handler(lambda addr, *args: _OSC["bridge"].message.emit(addr, list(args)))
+    try:
+        srv = ThreadingOSCUDPServer(("0.0.0.0", int(port)), d)
+    except OSError as exc:
+        _OSC["error"] = f"port {port} unavailable ({exc.strerror or exc})"
+        return _OSC["error"]
+    threading.Thread(target=srv.serve_forever, daemon=True, name="osc").start()
+    _OSC.update(server=srv, port=int(port), error="")
+    return ""
+
+
+def _osc_stop():
+    srv = _OSC.get("server")
+    if srv is not None:
+        try:
+            srv.shutdown()
+            srv.server_close()
+        except Exception:
+            pass
+    _OSC.update(server=None, port=0)
+
+
+def _osc_dispatch(addr: str, args: list):
+    _OSC["last"] = f"{addr} {' '.join(str(a) for a in args)}".strip()
+    target = next((w for w in _app_windows if w._worker), None) or \
+        (_app_windows[0] if _app_windows else None)
+    if target is not None:
+        target._on_osc(addr, args)
+    _osc_refresh_ui()
+
+
+def _osc_refresh_ui():
+    for w in _app_windows:
+        w.system_tab.set_osc_state(bool(_OSC["server"]), _OSC["port"],
+                                   _OSC["error"], _OSC["last"])
+
+
+def _osc_configure(enabled: bool, port: int):
+    """From the System tab: remember the choice and start / stop listening."""
+    st = _app_settings()
+    st.setValue("osc/enabled", bool(enabled))
+    st.setValue("osc/port", int(port))
+    if enabled:
+        _osc_start(port)
+    else:
+        _osc_stop()
+        _OSC["error"] = ""
+    _osc_refresh_ui()
+
+
 def _switch_theme(name: str):
     """Remember the theme, then rebuild every window in it (widgets read the
     colour names when they're built). Each window closes — releasing its
@@ -8280,6 +8487,8 @@ def _spawn_window(number: int) -> VideomancerApp:
     """Create and show a new VideomancerApp window."""
     w = VideomancerApp(window_number=number)
     _app_windows.append(w)
+    w.system_tab.on_osc = _osc_configure
+    w.system_tab.set_osc_state(bool(_OSC["server"]), _OSC["port"], _OSC["error"], _OSC["last"])
     w.show()
     return w
 
@@ -8386,6 +8595,13 @@ def main():
     count = max(1, len(initial_ports))  # always open at least one window
     for i in range(count):
         _spawn_window(i + 1)
+
+    app.aboutToQuit.connect(_osc_stop)
+    # OSC remote: resume listening if it was on last time
+    st = _app_settings()
+    if st.value("osc/enabled", False, type=bool):
+        _osc_start(st.value("osc/port", 9000, type=int))
+        _osc_refresh_ui()
 
     # Global hot-plug watcher: spawn a new window when a new device appears
     def _global_hotplug():

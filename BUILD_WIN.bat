@@ -15,7 +15,7 @@ if %errorlevel% neq 0 (
 
 REM Install dependencies
 echo Installing dependencies...
-pip install PyQt6 pyserial pyinstaller
+pip install PyQt6 pyserial python-osc pyinstaller
 
 REM Build
 echo.
@@ -26,6 +26,7 @@ pyinstaller --onefile --windowed ^
     --add-data "VM_Logo.png;." ^
     --add-data "VM.png;." ^
     --hidden-import serial.tools.list_ports ^
+    --hidden-import pythonosc.osc_server ^
     main.py
 
 echo.

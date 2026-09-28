@@ -55,7 +55,7 @@ Protocol gotchas (verified on firmware 1.0.0-rc.55):
 ## Run Videomancer from source
 
 ```bash
-pip install PyQt6 pyserial
+pip install PyQt6 pyserial python-osc
 python main.py
 ```
 
