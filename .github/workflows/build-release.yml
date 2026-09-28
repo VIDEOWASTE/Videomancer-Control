@@ -222,7 +222,11 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
-            ### New in 2.7
+            ### New in 2.8
+            - **OSC remote** — control the app from TouchOSC, Max, TouchDesigner, Resolume or Ableton (via Max for Live). Turn it on in System → OSC Remote (UDP port 9000 by default) and send `/videomancer/bpm 120`, `/play`, `/stop`, `/tap`, `/param/1`–`/param/12` (0.0–1.0), `/program "Name"`, `/program/next`, `/program/prev`, `/randomize`, `/undo`. Off by default; while on, any device on your network can send commands.
+            - Releases now ship a single universal macOS DMG (plus the updater zip) — no separate Intel download.
+
+            ### In 2.7
             - **Program Library tab** — browse LZX's official and community program libraries (every release), see what's on your SD card, and install, update or remove programs over USB. Downloads are checksum-verified; the app picks a library your firmware can run, warns before newer-firmware libraries, older versions, or running out of space.
             - **MY PROGRAMS** — your own programs on the card, with whether the Videomancer loaded them.
             - **70-program limit shown** — the Videomancer loads at most 70 programs from the SD card; the Library tab shows how many are skipped.
