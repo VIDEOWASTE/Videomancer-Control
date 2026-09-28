@@ -1561,6 +1561,47 @@ class _SplashWidget(QWidget):
 
 # ── Programs tab ───────────────────────────────────────────────────────
 
+from PyQt6.QtWidgets import QStyledItemDelegate
+from PyQt6.QtCore import QEvent
+
+
+class _StarDelegate(QStyledItemDelegate):
+    """Program rows: name on the left, a favourite star at the right end —
+    ☆ outline for normal programs, ★ filled for favourites."""
+    STAR_W = 34
+
+    def __init__(self, is_fav, parent=None):
+        super().__init__(parent)
+        self._is_fav = is_fav
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)          # row as usual (text, selection)
+        fav = self._is_fav(index.data(Qt.ItemDataRole.UserRole))
+        painter.save()
+        f = QFont(option.font)
+        if f.pixelSize() > 0:                 # list font is set in px by the stylesheet
+            f.setPixelSize(round(f.pixelSize() * 1.3))
+        elif f.pointSizeF() > 0:
+            f.setPointSizeF(f.pointSizeF() * 1.3)
+        painter.setFont(f)
+        painter.setPen(QColor(ACCENT2 if fav else TEXT_DIM))
+        star_rect = option.rect.adjusted(option.rect.width() - self.STAR_W, 0, 0, 0)
+        painter.drawText(star_rect, int(Qt.AlignmentFlag.AlignCenter),
+                         "\u2605" if fav else "\u2606")
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        """Click on the star toggles the favourite (and is swallowed so it
+        doesn't select or load the program)."""
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease,
+                            QEvent.Type.MouseButtonDblClick):
+            if event.position().x() >= option.rect.right() - self.STAR_W:
+                if event.type() == QEvent.Type.MouseButtonRelease:
+                    self.parent().on_star(index.data(Qt.ItemDataRole.UserRole))
+                return True
+        return super().editorEvent(event, model, option, index)
+
+
 def _app_settings():
     from PyQt6.QtCore import QSettings
     return QSettings("VIDEOWASTE", "Videomancer Control")
@@ -1630,6 +1671,10 @@ class ProgramsTab(QWidget):
         ll.addWidget(self.count_lbl)
 
         self.list_widget = QListWidget()
+        self.list_widget.on_star = self._toggle_favorite
+        self.list_widget.setItemDelegate(_StarDelegate(lambda n: n in self._favorites,
+                                                       self.list_widget))
+        self.list_widget.setMouseTracking(True)
         self.list_widget.itemDoubleClicked.connect(self._on_double)
         self.list_widget.currentItemChanged.connect(self._on_select)
         ll.addWidget(self.list_widget, stretch=1)
@@ -1682,17 +1727,6 @@ class ProgramsTab(QWidget):
 
         rl.addSpacing(16)
 
-        self.fav_btn = QPushButton("☆  ADD TO FAVORITES")
-        self.fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.fav_btn.setStyleSheet(
-            f"QPushButton{{background:transparent;border:1px solid {BORDER};"
-            f"border-radius:6px;color:{TEXT_DIM};font-size:11px;font-weight:bold;"
-            f"letter-spacing:1px;padding:4px 12px;}}"
-            f"QPushButton:hover{{border-color:#ffffff;color:#ffffff;}}"
-        )
-        self.fav_btn.setVisible(False)
-        self.fav_btn.clicked.connect(self._toggle_favorite)
-        rl.addWidget(self.fav_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.load_btn = QPushButton("⬤  LOAD PROGRAM")
         self.load_btn.setObjectName("primary")
@@ -1795,7 +1829,6 @@ class ProgramsTab(QWidget):
         elif not self._selected:
             # Nothing selected — show the active program in the panel
             self.name_lbl.setText(name)
-            self._update_fav_btn(name)
             self.active_pill.setVisible(True)
             self.desc_lbl.setVisible(False)
             self.load_btn.setText("⬤  RELOAD PROGRAM")
@@ -1815,7 +1848,7 @@ class ProgramsTab(QWidget):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             raw = item.data(Qt.ItemDataRole.UserRole)
-            label = f"★ {raw}" if raw in self._favorites else raw
+            label = raw
             if raw == self._active:
                 item.setText(f"▶  {label}")
                 item.setForeground(QColor('#ffffff'))
@@ -1832,8 +1865,8 @@ class ProgramsTab(QWidget):
             b.setChecked(k == key)
         self._rebuild(self.search.text())
 
-    def _toggle_favorite(self):
-        name = self._selected or self._active
+    def _toggle_favorite(self, name: Optional[str] = None):
+        name = name or self._selected or self._active
         if not name:
             return
         if name in self._favorites:
@@ -1841,13 +1874,10 @@ class ProgramsTab(QWidget):
         else:
             self._favorites.append(name)
         _app_settings().setValue("programs/favorites", self._favorites)
-        self._update_fav_btn(name)
-        self._rebuild(self.search.text())
-
-    def _update_fav_btn(self, name: Optional[str]):
-        self.fav_btn.setVisible(bool(name))
-        fav = name in self._favorites
-        self.fav_btn.setText("★  FAVORITE" if fav else "☆  ADD TO FAVORITES")
+        if self._view == "fav":
+            self._rebuild(self.search.text())      # list membership changed
+        else:
+            self.list_widget.viewport().update()   # just repaint the star
 
     def _rebuild(self, filt):
         self.list_widget.clear()
@@ -1873,7 +1903,6 @@ class ProgramsTab(QWidget):
         name = item.data(Qt.ItemDataRole.UserRole)
         self._selected = name
         self.name_lbl.setText(name)
-        self._update_fav_btn(name)
         self.active_pill.setVisible(name == self._active)
         self.desc_lbl.setText("")
         self.desc_lbl.setVisible(False)
