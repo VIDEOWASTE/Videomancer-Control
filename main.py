@@ -133,6 +133,35 @@ SD_PROGRAMS = "sd:/programs"
 SD_PROGRAM_LIMIT = 70
 
 
+_KNOWN_CACHE = {"key": None, "files": frozenset()}
+
+
+def _known_library_files() -> frozenset:
+    """Card-relative paths of every program in any library zip we have
+    cached: 'vendor/file.vmprog', plus the bare file name for LZX's own
+    (official programs end up loose on the card)."""
+    import zipfile
+    zips = sorted(_library_cache_dir().glob("*.zip"))
+    key = tuple((z.name, z.stat().st_mtime) for z in zips)
+    if key == _KNOWN_CACHE["key"]:
+        return _KNOWN_CACHE["files"]
+    out = set()
+    for zp in zips:
+        try:
+            with zipfile.ZipFile(zp) as z:
+                official = "program-library" in zp.name
+                for n in z.namelist():
+                    parts = n.split("/")
+                    if len(parts) == 3 and parts[0] == "programs" and n.endswith(".vmprog"):
+                        out.add(f"{parts[1]}/{parts[2]}")
+                        if official or parts[1] == "lzx":
+                            out.add(parts[2])
+        except Exception:
+            continue
+    _KNOWN_CACHE.update(key=key, files=frozenset(out))
+    return _KNOWN_CACHE["files"]
+
+
 def _norm_prog_name(s: str) -> str:
     """'temporal_diff_v1.0.0' / 'Temporal Diff' → 'temporaldiff' for matching
     card file names against the device's display names."""
@@ -5719,7 +5748,7 @@ class LibraryTab(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
         self._src_btns = {}
-        for src in LIBRARY_SOURCES + [{"key": "card", "label": "ON THIS CARD"}]:
+        for src in LIBRARY_SOURCES + [{"key": "card", "label": "MY PROGRAMS"}]:
             b = QPushButton(src["label"])
             b.setCheckable(True)
             b.setChecked(src["key"] == self._source)
@@ -5855,14 +5884,16 @@ class LibraryTab(QWidget):
         return {_norm_prog_name(n) for n in self._device_names}
 
     def _card_programs(self) -> list:
-        """Every .vmprog on the SD card, whatever its origin."""
+        """Programs on the SD card that aren't part of any LZX library
+        (the user's own builds, hand-copied files, unknown programs)."""
         out = []
-        known = {}
-        for rows in self._releases.values():
-            for r in rows:
-                known.setdefault(r["source"], r["version"])
+        known = set(_known_library_files())
+        # the card's manifest.json is the official library's catalogue
+        known |= {k for k in self._card_names if k.endswith(".vmprog")}
         for rel, size in sorted((self._device_files or {}).items()):
             folder, _, base = rel.rpartition("/")
+            if rel in known:
+                continue
             stem = re.sub(r"(?i)[_-]?v?\d+(\.\d+){1,2}$", "", base[:-7])
             name = self._card_names.get(rel) or self._card_names.get(base) or \
                 stem.replace("_", " ").title()
@@ -5889,8 +5920,7 @@ class LibraryTab(QWidget):
             self.capacity.setText(
                 f"\u26a0  SD card: {n} programs \u2014 the Videomancer loads {SD_PROGRAM_LIMIT}, "
                 f"so {over} {'is' if over == 1 else 'are'} skipped at boot. "
-                f"Remove {over} to load them all "
-                f"(ON THIS CARD lists everything).")
+                f"Remove {over} to load them all.")
             self.capacity.setStyleSheet(
                 f"color:#ffffff;background:#5a1f3a;border:1px solid {ERROR};border-radius:6px;"
                 f"padding:6px 8px;font-size:12px;")
@@ -5939,8 +5969,8 @@ class LibraryTab(QWidget):
             self._release = None
             self._programs = self._card_programs()
             self._render()
-            self.status.setText("Everything on the SD card. Remove programs you don't use to "
-                                "stay under the load limit.")
+            self.status.setText("Programs on your card that aren't from an LZX library \u2014 "
+                                "your own builds and anything added by hand.")
         else:
             self._fill_versions()
 
@@ -6169,7 +6199,7 @@ class LibraryTab(QWidget):
                 f"The Videomancer loads at most <b>{SD_PROGRAM_LIMIT}</b> programs from the SD "
                 f"card. After this install the card would hold <b>{after}</b>, so "
                 f"<b>{after - SD_PROGRAM_LIMIT}</b> won't load.<br><br>Remove programs first "
-                f"(ON THIS CARD lists everything), or install anyway?"):
+                f"(any library view or MY PROGRAMS), or install anyway?"):
             return
         total_kb = sum(p["size"] for p in progs) // 1024
         if not _VMConfirmDialog.ask(
@@ -7776,6 +7806,19 @@ fi
         self._lib_threads.add(t)
         t.finished.connect(lambda t=t: self._lib_threads.discard(t))
 
+    def _lib_prefetch(self, releases: dict):
+        """Quietly cache the newest release of each library so MY PROGRAMS
+        can tell library programs from the user's own."""
+        for rows in releases.values():
+            rel = next((r for r in rows if not r["prerelease"]), None)
+            if not rel or (_library_cache_dir() / rel["zip_name"]).exists():
+                continue
+            t = _LibraryDownloader(rel)
+            t.done.connect(lambda *_: self.library_tab._source == "card"
+                           and self.library_tab._set_source("card"))
+            self._lib_track(t)
+            t.start()
+
     def _lib_on_releases(self, releases: dict, from_cache: bool = False):
         if not from_cache:
             self._lib_fetched_at = time.monotonic()
@@ -7785,6 +7828,7 @@ fi
         self._lib_releases = releases
         self.library_tab.set_device_firmware(self.system_tab._device_fw)
         self.library_tab.set_releases(releases)
+        self._lib_prefetch(releases)
 
     def _lib_open_release(self, rel: dict):
         self.library_tab.status.setText(f"Downloading library {rel['version']}\u2026")
