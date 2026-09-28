@@ -5789,18 +5789,37 @@ class LibraryTab(QWidget):
         if rel and self.on_open_release:
             self.on_open_release(rel)
 
+    def card_path(self, p) -> Optional[str]:
+        """Where this library program sits on the card, relative to
+        sd:/programs: its author folder if present, else loose in programs/
+        (LZX Connect and Finder copies both leave programs there)."""
+        if not self._device_files:
+            return None
+        if p["file"] in self._device_files:
+            return p["file"]
+        vendor, _, base = p["file"].rpartition("/")
+        # Only LZX's own programs are matched by bare file name: the official
+        # library ends up loose in programs/, while a loose file that shares a
+        # community program's name is usually someone else's program (e.g. a
+        # user's own tetris.vmprog vs homegrownvhs/tetris.vmprog).
+        if vendor in ("", "lzx") and base in self._device_files:
+            return base
+        return None
+
     def _kind(self, p) -> str:
         """missing | installed | restart | update | newer | different | unknown"""
         if self._device_files is None:
             return "unknown"
-        size = self._device_files.get(p["file"])
+        cp = self.card_path(p)
+        size = self._device_files.get(cp) if cp else None
         if size is None:
             return "missing"
         if size == p["size"]:
             if self._device_names and p["name"] not in self._device_names:
                 return "restart"
             return "installed"
-        lib, card = _prog_version_key(p["version"]), _prog_version_key(self._device_versions.get(p["file"]))
+        card_ver = self._device_versions.get(cp) or self._device_versions.get(p["file"])
+        lib, card = _prog_version_key(p["version"]), _prog_version_key(card_ver)
         if lib and card and lib > card:
             return "update"
         if lib and card and lib < card:
@@ -5809,7 +5828,8 @@ class LibraryTab(QWidget):
 
     def _status_for(self, p) -> tuple:
         """(text, colour) for one library program vs the SD card."""
-        card_ver = self._device_versions.get(p["file"], "")
+        cp = self.card_path(p)
+        card_ver = (self._device_versions.get(cp) if cp else None) or self._device_versions.get(p["file"], "")
         return {
             "unknown":   ("\u2014", TEXT_DIM),
             "missing":   ("Not installed", TEXT_DIM),
@@ -5908,7 +5928,7 @@ class LibraryTab(QWidget):
         can_device = self._connected and not self._busy and self._device_files is not None
         self.install_btn.setEnabled(can_device and bool(checked))
         self.install_btn.setText(f"\u2B07  INSTALL {len(checked)}" if checked else "\u2B07  INSTALL")
-        on_card = [p for p in checked if self._device_files and p["file"] in self._device_files]
+        on_card = [p for p in checked if self.card_path(p)]
         self.remove_btn.setEnabled(can_device and bool(on_card))
         n_upd = len(self._updatable()) if self._programs else 0
         self.update_all_btn.setEnabled(can_device and n_upd > 0)
@@ -5935,7 +5955,7 @@ class LibraryTab(QWidget):
         if older and not _VMConfirmDialog.ask(
                 self, "Replace with an older version?",
                 "The card already has a <b>newer</b> version of:<br><br>"
-                + "<br>".join(f"{p['name']} — card {self._device_versions.get(p['file'], '?')}, "
+                + "<br>".join(f"{p['name']} — card {self._device_versions.get(self.card_path(p) or p['file'], '?')}, "
                               f"this library {p['version']}" for p in older[:8])
                 + ("<br>\u2026" if len(older) > 8 else "")
                 + "<br><br>Installing replaces them with the older version. Continue?"):
@@ -5951,7 +5971,7 @@ class LibraryTab(QWidget):
         self.on_install(rel, progs)
 
     def _remove_checked(self):
-        progs = [p for p in self._checked() if self._device_files and p["file"] in self._device_files]
+        progs = [p for p in self._checked() if self.card_path(p)]
         if not progs or not self.on_remove:
             return
         names = ", ".join(p["name"] for p in progs[:6]) + (" \u2026" if len(progs) > 6 else "")
@@ -6602,6 +6622,18 @@ fi
 
     @pyqtSlot()
     def _on_disconnected(self):
+        job = getattr(self, "_lib_job", None)
+        if job is not None:
+            self._lib_job = None
+            done = len(job["ok"])
+            left = [p["name"] for p in job["programs"]]
+            QTimer.singleShot(0, lambda: _VMConfirmDialog.notify(
+                self, "Videomancer restarted during install",
+                f"{done} program(s) were copied before the Videomancer disconnected."
+                + (f"\n\nNot copied: {', '.join(left[:6])}{' …' if len(left) > 6 else ''}"
+                   if left else "")
+                + "\n\nNothing more was written. When it reconnects, the Library tab "
+                  "shows what's on the card — install the rest from there."))
         self._fs_queue.clear()
         self._fs_watchdog.stop()
         if self._fs_current is not None:
@@ -7590,10 +7622,16 @@ fi
 
         vendors = []
 
+        def is_prog(n):
+            return n.endswith(".vmprog") and not n.startswith("._")   # ._ = Finder metadata
+
         def root_done(acc, err):
             if err is not None:
                 return finish(err)
-            vendors.extend(n for n, e in acc.items() if is_dir(e))
+            for n, e in acc.items():
+                if is_prog(n) and not is_dir(e):
+                    files[n] = int(e.get("size", -1))          # loose in programs/
+            vendors.extend(n for n, e in acc.items() if is_dir(e) and not n.startswith("."))
             next_vendor()
 
         def next_vendor():
@@ -7603,7 +7641,7 @@ fi
 
             def vdone(acc, err):
                 for n, e in acc.items():
-                    if n.endswith(".vmprog") and not is_dir(e):
+                    if is_prog(n) and not is_dir(e):
                         files[f"{v}/{n}"] = int(e.get("size", -1))
                 next_vendor()
             listdir(f"{SD_PROGRAMS}/{v}", vdone)
@@ -7653,8 +7691,8 @@ fi
                 self.library_tab.status.setText(f"Couldn't read the library zip: {exc}")
                 return
         total = sum(len(b) for b in blobs.values())
-        replaced = sum(max(0, (self.library_tab._device_files or {}).get(p["file"], 0))
-                       for p in programs)
+        replaced = sum(max(0, (self.library_tab._device_files or {}).get(
+                           self.library_tab.card_path(p) or "", 0)) for p in programs)
         need = total - replaced + 64 * 1024          # + manifest and headroom
         self._lib_set_busy(True, "Checking free space on the SD card\u2026")
 
@@ -7670,26 +7708,58 @@ fi
             self._lib_begin_install(rel, programs, blobs, total)
         self._fs("fs info", got_info)
 
+    def _lib_targets(self, programs, blobs):
+        """Decide each program's card path. Never creates folders: on rc.55
+        `fs mkdir` of a new folder resets the Videomancer (verified), so a
+        program goes into its author folder only if that already exists,
+        otherwise loose in sd:/programs/. Returns (placed, clashes)."""
+        on_card = self.library_tab._device_files or {}
+        folders = {k.split("/")[0] for k in on_card if "/" in k}
+        placed, clashes, new_blobs = [], [], {}
+        for p in programs:
+            vendor, base = (p["file"].split("/", 1) + [""])[:2] if "/" in p["file"] else ("", p["file"])
+            rel = p["file"] if vendor in folders else base
+            existing = self.library_tab.card_path(p)
+            if existing:
+                rel = existing                         # update in place
+            elif rel == base and base in on_card and vendor not in ("", "lzx"):
+                clashes.append(p)                      # a different program owns this name
+                continue
+            q = dict(p, card_file=rel, sd_path=f"{SD_PROGRAMS}/{rel}")
+            placed.append(q)
+            new_blobs[rel] = blobs[p["file"]]
+        return placed, clashes, new_blobs
+
     def _lib_begin_install(self, rel, programs, blobs, total):
+        programs, clashes, blobs = self._lib_targets(programs, blobs)
+        if clashes:
+            _VMConfirmDialog.notify(
+                self, "Name already in use",
+                "Skipping — the card already has a different program with the same "
+                "file name:\n\n" + "\n".join(f"{p['name']} ({p['file'].split('/')[-1]})"
+                                            for p in clashes))
+        if not programs:
+            self._lib_set_busy(False)
+            return
+        total = sum(len(b) for b in blobs.values())
         self._lib_set_busy(True, f"Installing {len(programs)} program(s)\u2026")
         self._lib_job = {"programs": list(programs), "blobs": blobs, "done_bytes": 0,
                          "total": total, "ok": [], "failed": [], "rel": rel}
-        vendors = sorted({p["file"].split("/")[0] for p in programs})
-        self._fs(f"fs mkdir {SD_PROGRAMS}", lambda _d: None)      # exists → error, fine
-        for v in vendors:
-            self._fs(f"fs mkdir {SD_PROGRAMS}/{v}", lambda _d: None)
-        self._fs("fs caps", lambda _d: self._lib_put_next())      # barrier after mkdirs
+        self._lib_put_next()
 
     def _lib_put_next(self):
         job = getattr(self, "_lib_job", None)
         if job is None:
             return
         if not job["programs"]:
-            return self._lib_update_manifest(job)
+            # The card's manifest.json is LZX Connect's catalogue; the firmware
+            # finds programs without it (verified on rc.55), so it's left as
+            # is — one less large write that a reset could corrupt.
+            return self._lib_finish(job, "")
         p = job["programs"][0]
         self.library_tab.set_progress(job["done_bytes"], job["total"],
                                       f"Copying {p['name']}\u2026")
-        self._worker.put_file(p["sd_path"], job["blobs"][p["file"]])
+        self._worker.put_file(p["sd_path"], job["blobs"][p["card_file"]])
 
     def _lib_put_progress(self, path: str, sent: int, total: int):
         job = getattr(self, "_lib_job", None)
@@ -7697,9 +7767,6 @@ fi
             self.library_tab.set_progress(job["done_bytes"] + sent, job["total"])
 
     def _lib_put_finished(self, path: str, ok: bool, msg: str):
-        mjob = getattr(self, "_lib_manifest_job", None)
-        if mjob is not None and path.endswith("/manifest.json"):
-            return self._lib_finish(mjob, "" if ok else "program index not updated")
         job = getattr(self, "_lib_job", None)
         if job is None:
             return
@@ -7724,8 +7791,10 @@ fi
         path = f"{SD_PROGRAMS}/manifest.json"
 
         def got_stat(d):
-            if not isinstance(d, dict) or "error" in d or "size" not in d:
+            if isinstance(d, dict) and "error" in d and "not found" in str(d["error"]).lower():
                 return done(None, missing=True)
+            if not isinstance(d, dict) or "size" not in d:
+                return done(None, missing=False)     # couldn't read ≠ doesn't exist
             size, buf = int(d["size"]), bytearray()
 
             def read_more(_=None):
@@ -7746,38 +7815,8 @@ fi
             read_more()
         self._fs(f"fs stat {path}", got_stat)
 
-    def _lib_update_manifest(self, job, removed: Optional[list] = None):
-        """Merge installed/removed programs into sd:/programs/manifest.json so
-        the card's own index describes them (the official zip ships one)."""
-        rel = job.get("rel") or {}
-
-        def merged(existing, missing):
-            if existing is None and not missing:
-                # Present but unreadable: leave it alone rather than clobber it.
-                return self._lib_finish(job, "manifest unreadable — left unchanged")
-            man = existing or {"format_version": "1.0", "product": "videomancer", "programs": []}
-            rows = {e.get("file"): e for e in man.get("programs", []) if isinstance(e, dict)}
-            for p in job["ok"]:
-                rows[p["file"]] = p.get("manifest_entry") or {
-                    "name": Path(p["file"]).stem, "program_id": p["program_id"],
-                    "program_name": p["name"], "program_version": p["version"],
-                    "categories": p["categories"], "program_type": "processing",
-                    "description": p["description"], "author": p["author"], "file": p["file"]}
-            for p in removed or []:
-                rows.pop(p["file"], None)
-            man["programs"] = sorted(rows.values(), key=lambda e: str(e.get("file")))
-            data = json.dumps(man, indent=2).encode()
-            self._lib_manifest_job = job
-            self._worker.put_file(f"{SD_PROGRAMS}/manifest.json", data)
-        if not job["ok"] and not removed:
-            return self._lib_finish(job, "")
-        self.library_tab.set_progress(job["total"], job["total"], "Updating the card's program index\u2026")
-        self._lib_job = None
-        self._lib_read_manifest(merged)
-
     def _lib_finish(self, job, note: str):
         self._lib_job = None
-        self._lib_manifest_job = None
         ok, failed = job["ok"], job["failed"]
         removed = job.get("removed", [])
 
@@ -7810,8 +7849,7 @@ fi
 
         def next_rm(_=None):
             if not pending:
-                return self._lib_update_manifest(job, removed=job["removed"]) \
-                    if job["removed"] else self._lib_finish(job, "")
+                return self._lib_finish(job, "")
             p = pending.pop(0)
 
             def got(d):
@@ -7820,7 +7858,9 @@ fi
                 else:
                     job["removed"].append(p)
                 next_rm()
-            self._fs(f"fs rm {p['sd_path']}", got)
+            cp = self.library_tab.card_path(p) or p["file"]
+            p = dict(p, card_file=cp)
+            self._fs(f"fs rm {SD_PROGRAMS}/{cp}", got)
         next_rm()
 
     def _lib_add_file(self, path: str):
@@ -7833,18 +7873,18 @@ fi
             return _VMConfirmDialog.notify(
                 self, "Not a Videomancer program",
                 f"{Path(path).name} isn't a valid .vmprog file.")
-        parts = info["program_id"].split(".")
-        vendor = re.sub(r"[^a-z0-9_-]", "", (parts[1] if len(parts) >= 3 else "user").lower()) or "user"
         fname = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(path).name)
-        prog = {"file": f"{vendor}/{fname}", "size": len(data),
-                "sd_path": f"{SD_PROGRAMS}/{vendor}/{fname}", "name": info["name"] or Path(path).stem,
+        prog = {"file": fname, "size": len(data),
+                "sd_path": f"{SD_PROGRAMS}/{fname}", "name": info["name"] or Path(path).stem,
                 "author": info["author"], "version": info["version"],
                 "description": info["description"], "categories": [],
                 "program_id": info["program_id"], "manifest_entry": None}
         if not _VMConfirmDialog.ask(
                 self, "Install Program",
                 f"Install <b>{prog['name']}</b> {prog['version']} by {prog['author'] or 'unknown'} "
-                f"to <code>{prog['sd_path']}</code>?"):
+                f"to <code>{prog['sd_path']}</code>?"
+                + ("<br><br><b>This replaces the file with the same name on the card.</b>"
+                   if fname in (self.library_tab._device_files or {}) else "")):
             return
         self._lib_install({}, [prog], file_blobs={prog["file"]: data})
 
