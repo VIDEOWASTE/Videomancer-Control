@@ -222,7 +222,13 @@ jobs:
 
             Desktop companion app for the LZX Industries Videomancer.
 
-            ### New in 2.8
+            ### New in 2.8.5
+            - **Neon theme** — cyberpunk green, alongside Purple and Amber (System → Application Settings → Theme). The wizard, the VIDEOMANCER title and the Dock icon now follow the theme: an orange wizard in Amber, a glowing neon one in Neon.
+            - Switching themes keeps the Videomancer connected.
+            - **Firmware check reads LZX's own release server**, so "Latest" shows the newest firmware (the GitHub mirror lags behind). Official program libraries are read from there too.
+            - Tidier System tab that fits without scrolling: LZX Connect, Firmware Releases, the manual and the forum sit in the Firmware box; a new Application Settings box holds Theme and App Releases; Copy/Console buttons moved to the status bar. The Device Health panel was removed.
+
+            ### In 2.8
             - **OSC remote** — control the app from TouchOSC, Max, TouchDesigner, Resolume or Ableton (via Max for Live). Turn it on in System → OSC Remote (UDP port 9000 by default) and send `/videomancer/bpm 120`, `/play`, `/stop`, `/tap`, `/param/1`–`/param/12` (0.0–1.0), `/program "Name"`, `/program/next`, `/program/prev`, `/randomize`, `/undo`. Off by default; while on, any device on your network can send commands.
             - Releases now ship a single universal macOS DMG (plus the updater zip) — no separate Intel download.
 
