@@ -4909,7 +4909,9 @@ class SystemTab(QWidget):
         top_row = QHBoxLayout()
         theme_lbl = QLabel("Theme")
         theme_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:13px;{self._TRANSPARENT}")
+        top_row.setSpacing(6)
         top_row.addWidget(theme_lbl)
+        top_row.addSpacing(6)
         self.on_theme = None           # (name) — set by the main window
         self._theme_btns = {}
         for key, label in (("purple", "PURPLE"), ("amber", "AMBER")):
@@ -5025,12 +5027,12 @@ class SystemTab(QWidget):
         # App row is static — show the running version always
         self._fw_fields["app"].setText(f"v{APP_VERSION}")
 
-        # LZX Connect / Firmware Releases pills (filled in below), then theme
-        self._fw_links_row = QHBoxLayout()
-        self._fw_links_row.setSpacing(6)
+        # LZX links (filled in below): Connect, Firmware Releases, Manual, Forum
+        self._fw_links = QGridLayout()
+        self._fw_links.setHorizontalSpacing(6)
+        self._fw_links.setVerticalSpacing(6)
         fl.addSpacing(4)
-        fl.addLayout(self._fw_links_row)
-        fl.addLayout(top_row)          # Theme toggle
+        fl.addLayout(self._fw_links)
         fl.addStretch()
         self._device_fw = ""
         self._latest_fw = ""
@@ -5127,8 +5129,8 @@ class SystemTab(QWidget):
 
         root.addLayout(grid)
 
-        # ·· LZX resources: each link says what it's for ··
-        res_grp = QGroupBox("LZX RESOURCES")
+        # ·· LZX links (in the Firmware box) + Application settings ··
+        res_grp = QGroupBox("APPLICATION SETTINGS")
         rg = QGridLayout(res_grp)
         rg.setHorizontalSpacing(8)
         rg.setVerticalSpacing(6)
@@ -5150,11 +5152,6 @@ class SystemTab(QWidget):
             f"border-radius:12px;color:#ffffff;font-size:12px;font-weight:bold;"
             f"padding:5px 12px;}}"
             f"QPushButton:hover{{background:{DIM};border-color:#ffffff;}}")
-        self._pill_css_hot = (
-            f"QPushButton{{background:{ACCENT2};border:1px solid #ffffff;"
-            f"border-radius:12px;color:#ffffff;font-size:12px;font-weight:bold;"
-            f"padding:5px 12px;}}"
-            f"QPushButton:hover{{background:{DIM};}}")
 
         def pill(title, blurb, url):
             btn = QPushButton(title + ("  \u2197" if url.startswith("http") else "  \u2192"))
@@ -5168,23 +5165,22 @@ class SystemTab(QWidget):
             return btn
 
         # Firmware links live with the firmware info …
-        firmware_titles = ("LZX Connect", "Firmware Releases")
+        firmware_titles = ("LZX Connect", "Firmware Releases",
+                           "Videomancer Manual", "Community Forum")
         self._connect_pill = None
-        for title, blurb, url in self._doc_links:
-            if title in firmware_titles:
-                btn = pill(title, blurb, url)
-                if title == "LZX Connect":
-                    self._connect_pill = btn
-                self._fw_links_row.addWidget(btn)
-        self._fw_links_row.addStretch(1)
-        # … the rest sit beside the SD card box, under Firmware.
-        rg.setHorizontalSpacing(6)
         i = 0
-        for title, blurb, url in self._doc_links:
-            if title in firmware_titles:
-                continue
-            rg.addWidget(pill(title, blurb, url), i // 2, i % 2, Qt.AlignmentFlag.AlignLeft)
+        for title in firmware_titles:
+            _t, blurb, url = next(d for d in self._doc_links if d[0] == title)
+            btn = pill(title, blurb, url)
+            if title == "LZX Connect":
+                self._connect_pill = btn
+            self._fw_links.addWidget(btn, i // 2, i % 2, Qt.AlignmentFlag.AlignLeft)
             i += 1
+        self._fw_links.setColumnStretch(2, 1)
+        # Application settings: theme + app releases, beside the SD card box
+        rg.addLayout(top_row, 0, 0, 1, 3)
+        _t, blurb, url = next(d for d in self._doc_links if d[0] == "App Releases")
+        rg.addWidget(pill("App Releases", blurb, url), 1, 0, Qt.AlignmentFlag.AlignLeft)
         rg.setColumnStretch(2, 1)
         grid.addWidget(res_grp, 1, 1)
 
@@ -5353,9 +5349,8 @@ class SystemTab(QWidget):
 
     def _refresh_fw_compare(self):
         outdated = self.firmware_outdated()
-        # A newer firmware lights up the LZX Connect pill (the updater)
+        # The LZX Connect pill's tooltip says when newer firmware is available
         if getattr(self, "_connect_pill", None) is not None:
-            self._connect_pill.setStyleSheet(self._pill_css_hot if outdated else self._pill_css)
             self._connect_pill.setToolTip(
                 (f"Firmware {self._latest_fw} is available — update it with LZX Connect\n"
                  if outdated else "Update firmware and install program libraries\n")
