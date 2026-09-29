@@ -5025,39 +5025,30 @@ class SystemTab(QWidget):
         # App row is static — show the running version always
         self._fw_fields["app"].setText(f"v{APP_VERSION}")
 
-        # Shown only when the device runs older firmware than LZX's newest
-        self.fw_update_btn = QPushButton("UPDATE WITH LZX CONNECT")
-        self.fw_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.fw_update_btn.setStyleSheet(
-            f"QPushButton{{background:{ACCENT2};border:2px solid #ffffff;"
-            f"border-radius:6px;color:#ffffff;font-size:12px;font-weight:bold;"
-            f"letter-spacing:1px;padding:6px 10px;}}"
-            f"QPushButton:hover{{background:{DIM};}}"
-        )
-        self.fw_update_btn.setVisible(False)
-        self.fw_update_btn.clicked.connect(lambda: self._open_doc(LZX_CONNECT_URL))
-        fl.addWidget(self.fw_update_btn)
+        # LZX Connect / Firmware Releases pills (filled in below), then theme
+        self._fw_links_row = QHBoxLayout()
+        self._fw_links_row.setSpacing(6)
+        fl.addSpacing(4)
+        fl.addLayout(self._fw_links_row)
+        fl.addLayout(top_row)          # Theme toggle
         fl.addStretch()
-        fl.addLayout(top_row)          # Theme toggle + Refresh
-        self._fw_box = fl              # firmware links are inserted above top_row
         self._device_fw = ""
         self._latest_fw = ""
         grid.addWidget(fw_grp, 0, 1)
 
         # ·· STORAGE (SD card as USB mass storage) ··
         storage_grp = QGroupBox("SD CARD AS USB DRIVE")
-        stg = QHBoxLayout(storage_grp)
-        stg.setSpacing(12)
+        stg = QVBoxLayout(storage_grp)
+        stg.setSpacing(6)
         storage_note = QLabel(
             "Mount the SD card on this computer to sideload programs or back "
             "up snapshots. Program loading pauses until you eject it."
         )
         storage_note.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;{self._TRANSPARENT}")
         storage_note.setWordWrap(True)
-        stg.addWidget(storage_note, stretch=1)
+        stg.addWidget(storage_note)
         self.msd_btn = QPushButton("MOUNT AS USB DRIVE")
         self.msd_btn.setEnabled(False)
-        self.msd_btn.setMinimumWidth(200)
         self.msd_btn.clicked.connect(self._on_msd_click)
         stg.addWidget(self.msd_btn)
 
@@ -5080,7 +5071,7 @@ class SystemTab(QWidget):
         self._msd_poll_timer = QTimer(self)
         self._msd_poll_timer.setInterval(2000)
         self._msd_poll_timer.timeout.connect(self._msd_poll_status)
-        grid.addWidget(storage_grp, 1, 0, 1, 2)
+        grid.addWidget(storage_grp, 1, 0)
 
         # ·· MIDI CC map: all 12 at once, 4 columns x 3 rows ··
         midi_grp = QGroupBox("MIDI CC  (MSB / LSB)")
@@ -5145,8 +5136,6 @@ class SystemTab(QWidget):
         self._doc_links = [
             ("LZX Connect", "Update firmware and install program libraries",
              LZX_CONNECT_URL),
-            ("Program Library", "Browse and install official & community programs",
-             "library:"),
             ("Videomancer Manual", "Official guide and serial command reference",
              "https://lzxindustries.net/instruments/videomancer/manual"),
             ("Firmware Releases", "Version history and release notes",
@@ -5156,15 +5145,22 @@ class SystemTab(QWidget):
             ("App Releases", "Videomancer Control downloads and changelog",
              f"https://github.com/{GITHUB_REPO}/releases"),
         ]
+        self._pill_css = (
+            f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
+            f"border-radius:12px;color:#ffffff;font-size:12px;font-weight:bold;"
+            f"padding:5px 12px;}}"
+            f"QPushButton:hover{{background:{DIM};border-color:#ffffff;}}")
+        self._pill_css_hot = (
+            f"QPushButton{{background:{ACCENT2};border:1px solid #ffffff;"
+            f"border-radius:12px;color:#ffffff;font-size:12px;font-weight:bold;"
+            f"padding:5px 12px;}}"
+            f"QPushButton:hover{{background:{DIM};}}")
+
         def pill(title, blurb, url):
             btn = QPushButton(title + ("  \u2197" if url.startswith("http") else "  \u2192"))
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(blurb + ("" if url == "library:" else f"\n{url}"))
-            btn.setStyleSheet(
-                f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
-                f"border-radius:12px;color:#ffffff;font-size:12px;font-weight:bold;"
-                f"padding:5px 12px;}}"
-                f"QPushButton:hover{{background:{DIM};border-color:#ffffff;}}")
+            btn.setStyleSheet(self._pill_css)
             if url == "library:":
                 btn.clicked.connect(lambda _c: self.on_open_library and self.on_open_library())
             else:
@@ -5172,24 +5168,25 @@ class SystemTab(QWidget):
             return btn
 
         # Firmware links live with the firmware info …
-        fw_links = QHBoxLayout()
-        fw_links.setSpacing(6)
         firmware_titles = ("LZX Connect", "Firmware Releases")
+        self._connect_pill = None
         for title, blurb, url in self._doc_links:
             if title in firmware_titles:
-                fw_links.addWidget(pill(title, blurb, url))
-        fw_links.addStretch(1)
-        self._fw_box.insertLayout(self._fw_box.count() - 1, fw_links)
-        # … everything else is one row of small pills.
+                btn = pill(title, blurb, url)
+                if title == "LZX Connect":
+                    self._connect_pill = btn
+                self._fw_links_row.addWidget(btn)
+        self._fw_links_row.addStretch(1)
+        # … the rest sit beside the SD card box, under Firmware.
         rg.setHorizontalSpacing(6)
-        col = 0
+        i = 0
         for title, blurb, url in self._doc_links:
             if title in firmware_titles:
                 continue
-            rg.addWidget(pill(title, blurb, url), 0, col)
-            col += 1
-        rg.setColumnStretch(col, 1)
-        root.addWidget(res_grp)
+            rg.addWidget(pill(title, blurb, url), i // 2, i % 2, Qt.AlignmentFlag.AlignLeft)
+            i += 1
+        rg.setColumnStretch(2, 1)
+        grid.addWidget(res_grp, 1, 1)
 
         root.addStretch(1)
 
@@ -5209,7 +5206,6 @@ class SystemTab(QWidget):
         self.timing_combo.setEnabled(v)
         if not v:
             self._device_fw = ""
-            self.fw_update_btn.setVisible(False)
             for key, val in self._fw_fields.items():
                 # "app" and "latest" don't depend on the device
                 if key in ("app", "latest"):
@@ -5357,7 +5353,13 @@ class SystemTab(QWidget):
 
     def _refresh_fw_compare(self):
         outdated = self.firmware_outdated()
-        self.fw_update_btn.setVisible(outdated)
+        # A newer firmware lights up the LZX Connect pill (the updater)
+        if getattr(self, "_connect_pill", None) is not None:
+            self._connect_pill.setStyleSheet(self._pill_css_hot if outdated else self._pill_css)
+            self._connect_pill.setToolTip(
+                (f"Firmware {self._latest_fw} is available — update it with LZX Connect\n"
+                 if outdated else "Update firmware and install program libraries\n")
+                + LZX_CONNECT_URL)
         colour = WARN if outdated else TEXT
         self._fw_fields["latest"].setStyleSheet(
             f"color:{colour};font-size:15px;font-weight:bold;{self._TRANSPARENT}")
@@ -6875,16 +6877,48 @@ fi
         _claimed_ports.add(port)
         self._claimed_port = port
         self._worker = SerialWorker(self)
-        self._worker.connected.connect(self._on_connected)
-        self._worker.disconnected.connect(self._on_disconnected)
-        self._worker.response.connect(self._on_response)
-        self._worker.put_progress.connect(self._lib_put_progress)
-        self._worker.put_finished.connect(self._lib_put_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.programs_page.connect(self._on_programs_page)
-        self._worker.status_update.connect(self._on_status_update)
+        self._wire_worker(self._worker)
         self.status_bar.showMessage(f"Connecting to {port}…")
         self._worker.connect_port(port)
+
+    def _worker_links(self, w):
+        return [(w.connected, self._on_connected), (w.disconnected, self._on_disconnected),
+                (w.response, self._on_response), (w.put_progress, self._lib_put_progress),
+                (w.put_finished, self._lib_put_finished), (w.error, self._on_error),
+                (w.programs_page, self._on_programs_page),
+                (w.status_update, self._on_status_update)]
+
+    def _wire_worker(self, w):
+        for sig, slot in self._worker_links(w):
+            sig.connect(slot)
+
+    def release_worker(self):
+        """Detach the live serial connection (for a theme rebuild) without
+        closing the port. Returns (worker, port) or None."""
+        w, port = self._worker, self._claimed_port
+        if w is None or not w.isRunning():
+            return None
+        for sig, slot in self._worker_links(w):
+            try:
+                sig.disconnect(slot)
+            except TypeError:
+                pass
+        self._poll_timer.stop()
+        self._worker = None
+        self._claimed_port = None          # stays in _claimed_ports for the new window
+        return w, port
+
+    def adopt_worker(self, w, port):
+        """Take over a running connection from a window being rebuilt."""
+        w.setParent(self)
+        self._worker = w
+        self._wire_worker(w)
+        self._on_connected(port)
+        self.status_bar.showMessage(f"Connected — {port}", 3000)
+        for cmd in ("version", "status", "video status", "modulation cc-map",
+                    "transport status", "program info"):
+            w.send(cmd)
+        self._fetch_programs()
 
     def _do_disconnect(self):
         # Manual disconnect: stay disconnected until the user clicks Connect
@@ -8275,7 +8309,7 @@ fi
             self._fw_announced = True
             self.status_bar.showMessage(
                 f"Firmware {self.system_tab._latest_fw} is available — "
-                f"System tab \u2192 Update with LZX Connect", 10000)
+                f"update it with LZX Connect (System tab)", 10000)
 
     def _on_tab_changed(self, idx: int):
         if idx == 4 and not self._worker and not self._lib_releases:
@@ -8467,14 +8501,17 @@ def _osc_configure(enabled: bool, port: int):
 
 def _switch_theme(name: str):
     """Remember the theme, then rebuild every window in it (widgets read the
-    colour names when they're built). Each window closes — releasing its
-    port — and a fresh one reconnects automatically on the System tab."""
+    colour names when they're built). The live serial connection is handed
+    from the old window to the new one, so the Videomancer stays connected."""
     _app_settings().setValue("appearance/theme", name)
     _apply_theme(name)
     for old in list(_app_windows):
         number, geo = old._window_number, old.geometry()
+        live = old.release_worker()        # keep the Videomancer connected
         old.close()
         new = _spawn_window(number)
+        if live:
+            new.adopt_worker(*live)
         new.setGeometry(geo)
         new.tabs.setCurrentIndex(2)
 
