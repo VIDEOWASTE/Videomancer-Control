@@ -4897,7 +4897,7 @@ class SystemTab(QWidget):
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.clicked.connect(self._refresh)
         top_row.addWidget(self.refresh_btn)
-        root.addLayout(top_row)
+        # (added to the FIRMWARE box below — saves a row so the tab fits)
 
         # Two equal columns; every section visible at the default window size
         grid = QGridLayout()
@@ -5003,6 +5003,7 @@ class SystemTab(QWidget):
         self.fw_update_btn.clicked.connect(lambda: self._open_doc(LZX_CONNECT_URL))
         fl.addWidget(self.fw_update_btn)
         fl.addStretch()
+        fl.addLayout(top_row)          # Theme toggle + Refresh
         self._device_fw = ""
         self._latest_fw = ""
         grid.addWidget(fw_grp, 0, 1)
@@ -5096,8 +5097,12 @@ class SystemTab(QWidget):
         self.osc_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         orow.addWidget(self.osc_status, stretch=1)
         og.addLayout(orow)
-        self.osc_help = QLabel(OSC_HELP)
-        self.osc_help.setWordWrap(True)
+        self.osc_help = QLabel(
+            "/videomancer/bpm \u00b7 /play \u00b7 /stop \u00b7 /tap \u00b7 /param/1\u201312 "
+            "\u00b7 /program \u00b7 /randomize \u2026   (hover for all)   "
+            "\u26a0 anyone on your network can send while on")
+        self.osc_help.setToolTip(OSC_HELP)
+        self.osc_help.setWordWrap(False)
         self.osc_help.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.osc_help.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;{self._TRANSPARENT}")
         og.addWidget(self.osc_help)
@@ -5109,7 +5114,7 @@ class SystemTab(QWidget):
         res_grp = QGroupBox("LZX RESOURCES")
         rg = QGridLayout(res_grp)
         rg.setHorizontalSpacing(8)
-        rg.setVerticalSpacing(8)
+        rg.setVerticalSpacing(6)
         self.on_open_library = None      # set by the main window
         self._doc_links = [
             ("LZX Connect", "Update firmware and install program libraries",
@@ -5129,13 +5134,13 @@ class SystemTab(QWidget):
             card = QPushButton()
             card.setCursor(Qt.CursorShape.PointingHandCursor)
             card.setToolTip(url if url != "library:" else "Open the LIBRARY tab")
-            card.setMinimumHeight(54)
+            card.setMinimumHeight(46)
             card.setStyleSheet(
                 f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
                 f"border-radius:6px;text-align:left;padding:0;}}"
                 f"QPushButton:hover{{background:{DIM};border-color:#ffffff;}}")
             cl = QVBoxLayout(card)
-            cl.setContentsMargins(12, 6, 12, 6)
+            cl.setContentsMargins(12, 4, 12, 4)
             cl.setSpacing(1)
             t = QLabel(title + ("  \u2197" if url.startswith("http") else "  \u2192"))
             t.setStyleSheet(f"color:#ffffff;font-size:14px;font-weight:bold;{self._TRANSPARENT}")
@@ -6906,6 +6911,8 @@ fi
         self.conn_bar.set_connected(port)
         self.library_tab.set_connected(True)
         self._lib_scan_on_boot = True    # scan the card once the program list is in
+        if self.tabs.currentIndex() == 2:
+            QTimer.singleShot(2000, self._poll_health)
         self.prog_tab.set_connected(True)
         self.param_tab.set_connected(True)
         self.system_tab.set_connected(True)
@@ -8291,15 +8298,23 @@ fi
                 f"System tab \u2192 Update with LZX Connect", 10000)
 
     def _poll_health(self):
-        if self._worker and self.tabs.currentIndex() == 2 and not self._library_busy:
+        """Every 5 s while the System tab is showing. Skips a tick when it
+        can't poll (not connected, card scan running) instead of stopping —
+        stopping here left Device Health blank until the tab was reopened."""
+        if self.tabs.currentIndex() != 2:
+            self._health_timer.stop()
+            return
+        if not self._health_timer.isActive():
+            self._health_timer.start()
+        if self._worker and not self._library_busy:
             for cmd in ("cpu", "ram", "fpga status", "fs info"):
                 self._worker.send(cmd)
-        else:
-            self._health_timer.stop()
 
     def _on_tab_changed(self, idx: int):
         if idx != 2:
             self._health_timer.stop()
+        else:
+            self._health_timer.start()
         if idx == 4 and not self._worker and not self._lib_releases:
             self._lib_refresh()          # browse the library even when offline
         if not self._worker:
