@@ -44,6 +44,7 @@ Protocol gotchas (verified on firmware 1.0.0-rc.55):
 - `program state` reports toggles as 0/1; the app sends 1023 for ON.
 - Time/Space/Slope are positional: `modulation set <ch> <manual> <time> <space> <slope>`. The old `modulation set <ch> <val> <t|sp|sl>` form (RC11) does not work on current firmware.
 - SD card (rc.55): `fs mkdir` of a NEW folder resets the device — the Library installer never creates folders (existing author folder, else loose in `sd:/programs/`). The firmware finds programs without `sd:/programs/manifest.json`, so the app only reads it. At most **70** SD programs load at boot (`SD_PROGRAM_LIMIT`); Finder `._` files don't count. `fs put` owns the link until its last byte — `SerialWorker.put_file` runs uploads exclusively.
+- Firmware and the official program library are published on LZX's Forgejo (`git.lzxindustries.net/api/v1/repos/lzx/videomancer-firmware`) before the GitHub mirror; `_fetch_releases` reads Forgejo first and merges GitHub. The community library is GitHub-only.
 - Knob drags go through `_queue_cmd` (~30 Hz coalescing); polls through `_poll_once` (one in flight); device readback for a channel is ignored for `EDIT_GUARD_S` after a local edit.
 
 ## Videomancer — release flow

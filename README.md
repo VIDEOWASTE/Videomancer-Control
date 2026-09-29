@@ -46,8 +46,7 @@ The app auto-connects whenever you plug in your Videomancer. No manual port conf
 - **Program Library** — browse LZX's official and community libraries, see what's on your SD card, and install / update / remove programs over USB (checksum-verified, firmware-compatibility and free-space checks). **MY PROGRAMS** lists your own programs on the card. Shows the 70-program load limit.
 - **Themes** — Videomancer Purple or Amber (System tab)
 - **OSC Remote** — control the app from TouchOSC, Max, TouchDesigner, Resolume or Ableton (via Max for Live): turn it on in System → OSC Remote (UDP port 9000 by default) and send `/videomancer/bpm 120`, `/videomancer/play`, `/stop`, `/tap`, `/param/1`–`/param/12` (0.0–1.0), `/program "Name"`, `/program/next`, `/program/prev`, `/randomize`, `/undo`
-- **Firmware Check** — compares your Videomancer's firmware with LZX's newest release and links straight to LZX Connect when an update is out
-- **Device Health** — CPU, memory, FPGA state and SD card space on the System tab
+- **Firmware Check** — compares your Videomancer's firmware with LZX's newest release (LZX's own release server, same as LZX Connect) and links straight to LZX Connect when an update is out
 - **Keyboard Shortcuts** — Space play/stop · T tap tempo · ⌘1–4 switch tabs · ⌘F find a program · ⌘R refresh
 - **12-Channel Parameter Control** — custom knobs, faders, and toggles with live bidirectional sync
 - **LFO Modulation** — assign modulators (Free LFO, Sync LFO, Audio Input, Step Seq, Random, Envelope, and 30+ more) with per-operator waveform visualization (smooth, audio-style, stepped, or jagged)

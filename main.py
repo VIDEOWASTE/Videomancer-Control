@@ -73,7 +73,42 @@ class _UpdateChecker(QThread):
 
 
 LZX_CONNECT_URL = "https://lzxindustries.net/connect"
-FIRMWARE_REPO = "lzxindustries/videomancer-firmware"
+FIRMWARE_REPO = "lzxindustries/videomancer-firmware"       # GitHub mirror
+# LZX publishes firmware and the official program library on its own
+# Forgejo server first; the GitHub mirror lags (rc.55 there vs rc.62 on
+# Forgejo, Sept 2026). LZX Connect reads Forgejo too.
+LZX_FORGEJO_API = "https://git.lzxindustries.net/api/v1/repos"
+LZX_FORGEJO_FIRMWARE = "lzx/videomancer-firmware"
+FIRMWARE_RELEASES_URL = "https://git.lzxindustries.net/lzx/videomancer-firmware/releases"
+
+
+def _fetch_releases(sources) -> list:
+    """Release JSON from several endpoints, merged by tag — the first source
+    listing a tag wins. Unreachable sources are skipped; raises only if every
+    source fails."""
+    from urllib.request import urlopen, Request
+    merged, errors = {}, []
+    for url in sources:
+        try:
+            req = Request(url, headers={"Accept": "application/json",
+                                        "User-Agent": "VideomancerControl"})
+            with urlopen(req, timeout=15) as resp:
+                rows = json.loads(resp.read().decode())
+            for r in rows if isinstance(rows, list) else []:
+                tag = r.get("tag_name", "")
+                if tag not in merged:
+                    merged[tag] = r
+                elif not _library_target_firmware(merged[tag].get("body") or "") and \
+                        _library_target_firmware(r.get("body") or ""):
+                    # keep the first source's assets, borrow the other's notes
+                    # (e.g. "rebuilt for Videomancer 1.0.0-rc.61")
+                    merged[tag] = dict(merged[tag], body=(merged[tag].get("body") or "")
+                                       + "\n\n" + r["body"])
+        except Exception as exc:
+            errors.append(exc)
+    if not merged and errors:
+        raise errors[0]
+    return list(merged.values())
 
 
 def _fw_version_key(v: str):
@@ -87,19 +122,17 @@ def _fw_version_key(v: str):
 
 
 class _FirmwareChecker(QThread):
-    """Finds the newest Videomancer firmware on LZX's GitHub releases.
-    Firmware tags look like `videomancer/1.0.0-rc.55`; the same repo also
-    carries `connect/…` and `programs/…` tags, which are ignored."""
+    """Finds the newest Videomancer firmware LZX has published (their Forgejo
+    server, falling back to the GitHub mirror). Firmware tags look like
+    `videomancer/1.0.0-rc.62`; `connect/…` and `programs/…` are ignored."""
     latest_found = pyqtSignal(str)
 
     def run(self):
         try:
-            from urllib.request import urlopen, Request
-            url = f"https://api.github.com/repos/{FIRMWARE_REPO}/releases?per_page=50"
-            req = Request(url, headers={"Accept": "application/vnd.github+json",
-                                        "User-Agent": "VideomancerControl"})
-            with urlopen(req, timeout=10) as resp:
-                releases = json.loads(resp.read().decode())
+            releases = _fetch_releases([
+                f"{LZX_FORGEJO_API}/{LZX_FORGEJO_FIRMWARE}/releases?limit=50",
+                f"https://api.github.com/repos/{FIRMWARE_REPO}/releases?per_page=50",
+            ])
             best = None
             for r in releases:
                 tag = r.get("tag_name", "")
@@ -123,7 +156,8 @@ class _FirmwareChecker(QThread):
 
 LIBRARY_SOURCES = [
     {"key": "official", "label": "OFFICIAL LZX",
-     "repo": "lzxindustries/videomancer-firmware", "tag_prefix": "programs/"},
+     "repo": "lzxindustries/videomancer-firmware", "tag_prefix": "programs/",
+     "forgejo": LZX_FORGEJO_FIRMWARE},
     {"key": "community", "label": "COMMUNITY",
      "repo": "lzxindustries/videomancer-community-programs", "tag_prefix": ""},
 ]
@@ -227,11 +261,11 @@ class _LibraryIndexFetcher(QThread):
         out = {}
         try:
             for src in LIBRARY_SOURCES:
-                url = f"https://api.github.com/repos/{src['repo']}/releases?per_page=40"
-                req = Request(url, headers={"Accept": "application/vnd.github+json",
-                                            "User-Agent": "VideomancerControl"})
-                with urlopen(req, timeout=15) as resp:
-                    rels = json.loads(resp.read().decode())
+                urls = [f"https://api.github.com/repos/{src['repo']}/releases?per_page=40"]
+                if src.get("forgejo"):     # LZX's own server first (newer releases)
+                    urls.insert(0, f"{LZX_FORGEJO_API}/{src['forgejo']}/releases?limit=50")
+                rels = _fetch_releases(urls)
+                rels.sort(key=lambda r: r.get("published_at") or "", reverse=True)
                 rows = []
                 for r in rels:
                     tag = r.get("tag_name", "")
@@ -259,7 +293,7 @@ class _LibraryIndexFetcher(QThread):
                 out[src["key"]] = rows
             self.releases_ready.emit(out)
         except Exception as exc:
-            self.failed.emit(f"Couldn't reach GitHub: {exc}")
+            self.failed.emit(f"Couldn't reach LZX's release servers: {exc}")
 
 
 class _LibraryDownloader(QThread):
@@ -4893,10 +4927,11 @@ class SystemTab(QWidget):
             top_row.addWidget(b)
             self._theme_btns[key] = b
         top_row.addStretch(1)
-        self.refresh_btn = QPushButton("\u21bb  Refresh")
-        self.refresh_btn.setEnabled(False)
+        # The tab refreshes itself when opened; the button is kept (hidden)
+        # only because other code toggles its enabled state.
+        self.refresh_btn = QPushButton("\u21bb  Refresh", self)
+        self.refresh_btn.setVisible(False)
         self.refresh_btn.clicked.connect(self._refresh)
-        top_row.addWidget(self.refresh_btn)
         # (added to the FIRMWARE box below — saves a row so the tab fits)
 
         # Two equal columns; every section visible at the default window size
@@ -5004,36 +5039,27 @@ class SystemTab(QWidget):
         fl.addWidget(self.fw_update_btn)
         fl.addStretch()
         fl.addLayout(top_row)          # Theme toggle + Refresh
+        self._fw_box = fl              # firmware links are inserted above top_row
         self._device_fw = ""
         self._latest_fw = ""
         grid.addWidget(fw_grp, 0, 1)
 
-        # ·· DEVICE HEALTH (polled while this tab is visible) ··
-        health_grp = QGroupBox("DEVICE HEALTH")
-        hl = QVBoxLayout(health_grp)
-        self._health_fields = {}
-        field_rows(hl, [("CPU", "cpu"), ("Memory", "ram"),
-                        ("FPGA", "fpga"), ("SD card", "sd")], self._health_fields)
-        hl.addStretch()
-        self._cpu = {}
-        grid.addWidget(health_grp, 1, 0)
-
         # ·· STORAGE (SD card as USB mass storage) ··
         storage_grp = QGroupBox("SD CARD AS USB DRIVE")
-        stg = QVBoxLayout(storage_grp)
-        stg.setSpacing(6)
+        stg = QHBoxLayout(storage_grp)
+        stg.setSpacing(12)
         storage_note = QLabel(
             "Mount the SD card on this computer to sideload programs or back "
             "up snapshots. Program loading pauses until you eject it."
         )
         storage_note.setStyleSheet(f"color:{TEXT_DIM};font-size:12px;{self._TRANSPARENT}")
         storage_note.setWordWrap(True)
-        stg.addWidget(storage_note)
+        stg.addWidget(storage_note, stretch=1)
         self.msd_btn = QPushButton("MOUNT AS USB DRIVE")
         self.msd_btn.setEnabled(False)
+        self.msd_btn.setMinimumWidth(200)
         self.msd_btn.clicked.connect(self._on_msd_click)
         stg.addWidget(self.msd_btn)
-        stg.addStretch()
 
         self._msd_state = "idle"  # idle | waiting | mounted
         # Failsafe: optimistically promote waiting → mounted after 15 s
@@ -5054,7 +5080,7 @@ class SystemTab(QWidget):
         self._msd_poll_timer = QTimer(self)
         self._msd_poll_timer.setInterval(2000)
         self._msd_poll_timer.timeout.connect(self._msd_poll_status)
-        grid.addWidget(storage_grp, 1, 1)
+        grid.addWidget(storage_grp, 1, 0, 1, 2)
 
         # ·· MIDI CC map: all 12 at once, 4 columns x 3 rows ··
         midi_grp = QGroupBox("MIDI CC  (MSB / LSB)")
@@ -5124,38 +5150,45 @@ class SystemTab(QWidget):
             ("Videomancer Manual", "Official guide and serial command reference",
              "https://lzxindustries.net/instruments/videomancer/manual"),
             ("Firmware Releases", "Version history and release notes",
-             f"https://github.com/{FIRMWARE_REPO}/releases"),
+             FIRMWARE_RELEASES_URL),
             ("Community Forum", "Help desk, patches and discussion",
              "https://community.lzxindustries.net/"),
             ("App Releases", "Videomancer Control downloads and changelog",
              f"https://github.com/{GITHUB_REPO}/releases"),
         ]
-        for i, (title, blurb, url) in enumerate(self._doc_links):
-            card = QPushButton()
-            card.setCursor(Qt.CursorShape.PointingHandCursor)
-            card.setToolTip(url if url != "library:" else "Open the LIBRARY tab")
-            card.setMinimumHeight(46)
-            card.setStyleSheet(
+        def pill(title, blurb, url):
+            btn = QPushButton(title + ("  \u2197" if url.startswith("http") else "  \u2192"))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(blurb + ("" if url == "library:" else f"\n{url}"))
+            btn.setStyleSheet(
                 f"QPushButton{{background:{SURFACE2};border:1px solid {BORDER};"
-                f"border-radius:6px;text-align:left;padding:0;}}"
+                f"border-radius:12px;color:#ffffff;font-size:12px;font-weight:bold;"
+                f"padding:5px 12px;}}"
                 f"QPushButton:hover{{background:{DIM};border-color:#ffffff;}}")
-            cl = QVBoxLayout(card)
-            cl.setContentsMargins(12, 4, 12, 4)
-            cl.setSpacing(1)
-            t = QLabel(title + ("  \u2197" if url.startswith("http") else "  \u2192"))
-            t.setStyleSheet(f"color:#ffffff;font-size:14px;font-weight:bold;{self._TRANSPARENT}")
-            b = QLabel(blurb)
-            b.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;{self._TRANSPARENT}")
-            for lbl in (t, b):
-                lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-                cl.addWidget(lbl)
             if url == "library:":
-                card.clicked.connect(lambda _c: self.on_open_library and self.on_open_library())
+                btn.clicked.connect(lambda _c: self.on_open_library and self.on_open_library())
             else:
-                card.clicked.connect(lambda _c, u=url: self._open_doc(u))
-            rg.addWidget(card, i // 3, i % 3)
-        for c in range(3):
-            rg.setColumnStretch(c, 1)
+                btn.clicked.connect(lambda _c, u=url: self._open_doc(u))
+            return btn
+
+        # Firmware links live with the firmware info …
+        fw_links = QHBoxLayout()
+        fw_links.setSpacing(6)
+        firmware_titles = ("LZX Connect", "Firmware Releases")
+        for title, blurb, url in self._doc_links:
+            if title in firmware_titles:
+                fw_links.addWidget(pill(title, blurb, url))
+        fw_links.addStretch(1)
+        self._fw_box.insertLayout(self._fw_box.count() - 1, fw_links)
+        # … everything else is one row of small pills.
+        rg.setHorizontalSpacing(6)
+        col = 0
+        for title, blurb, url in self._doc_links:
+            if title in firmware_titles:
+                continue
+            rg.addWidget(pill(title, blurb, url), 0, col)
+            col += 1
+        rg.setColumnStretch(col, 1)
         root.addWidget(res_grp)
 
         root.addStretch(1)
@@ -5177,8 +5210,6 @@ class SystemTab(QWidget):
         if not v:
             self._device_fw = ""
             self.fw_update_btn.setVisible(False)
-            for val in self._health_fields.values():
-                val.setText("\u2014")
             for key, val in self._fw_fields.items():
                 # "app" and "latest" don't depend on the device
                 if key in ("app", "latest"):
@@ -5333,34 +5364,6 @@ class SystemTab(QWidget):
         if self._latest_fw and self._device_fw and not outdated:
             self._fw_fields["latest"].setText(f"{self._latest_fw}  \u2714")
             self._fw_fields["latest"].setToolTip("Your Videomancer is on the newest firmware")
-
-    def apply_health(self, kind: str, data: dict):
-        f = self._health_fields
-        if kind == "cpu":
-            for core, d in data.items():
-                if isinstance(d, dict) and "usage" in d:
-                    self._cpu[core] = d["usage"]
-            f["cpu"].setText("  ".join(f"{c.replace('core', 'C')} {u}%"
-                                       for c, u in sorted(self._cpu.items())))
-        elif kind == "ram":
-            heap = data.get("heap") or {}
-            if "used" in heap and "total" in heap:
-                f["ram"].setText(f"heap {heap['used']} / {heap['total']} KB")
-        elif kind == "fpga":
-            state = str(data.get("state", "?")).upper()
-            prog = data.get("program", "")
-            f["fpga"].setText(f"{state} \u00b7 {prog}" if prog else state)
-            f["fpga"].setStyleSheet(
-                f"color:{TEXT if data.get('configured', True) else ERROR};"
-                f"font-size:16px;font-weight:bold;{self._TRANSPARENT}")
-        elif kind == "fs":
-            if not data.get("present", True):
-                f["sd"].setText("NO CARD")
-            elif not data.get("mounted", True):
-                f["sd"].setText("NOT MOUNTED")
-            elif "free" in data and "total" in data:
-                gb = 1024 ** 3
-                f["sd"].setText(f"{data['free']/gb:.1f} GB free of {data['total']/gb:.1f} GB")
 
     def _refresh(self):
         self._fetch_status()
@@ -6387,9 +6390,6 @@ class VideomancerApp(QMainWindow):
         self._fw_checker = _FirmwareChecker()
         self._fw_checker.latest_found.connect(self._on_latest_firmware)
         self._fw_checker.start()
-        self._health_timer = QTimer(self)
-        self._health_timer.setInterval(5000)
-        self._health_timer.timeout.connect(self._poll_health)
         self._update_checker = _UpdateChecker()
         self._update_checker.update_available.connect(self._on_update_available)
         self._update_checker.start()
@@ -6503,35 +6503,23 @@ class VideomancerApp(QMainWindow):
         self._header_prog_lbl.setVisible(False)
         bl.addWidget(self.tabs, stretch=1)
 
-        # Console
-        # Collapsible console
+        # Collapsible console — its COPY / CONSOLE buttons live in the status
+        # bar (added below) instead of a footer row, so tabs keep the height.
         self._console_visible = False
-        console_header = QHBoxLayout()
-        console_header.addStretch()
-        console_lbl = QLabel("SERIAL CONSOLE")
-        console_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;letter-spacing:2px;")
-        console_header.addWidget(console_lbl)
-        console_header.addSpacing(12)
+        small = (f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};"
+                 f"border-radius:3px;color:{TEXT_DIM};font-size:10px;padding:0 6px;}}"
+                 f"QPushButton:hover{{color:{TEXT};}}")
         copy_btn = QPushButton("COPY")
-        copy_btn.setFixedHeight(22)
-        copy_btn.setFixedWidth(54)
-        copy_btn.setStyleSheet(f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};border-radius:3px;color:{TEXT_DIM};font-size:10px;padding:0;}}QPushButton:hover{{color:{TEXT};}}")
+        copy_btn.setFixedHeight(18)
+        copy_btn.setToolTip("Copy the serial console to the clipboard")
+        copy_btn.setStyleSheet(small)
         self._copy_btn = copy_btn
         copy_btn.clicked.connect(lambda: self.console._copy_all())
-        console_header.addWidget(copy_btn)
-        self._console_toggle_btn = QPushButton("▶  SHOW")
-        self._console_toggle_btn.setFixedHeight(22)
-        self._console_toggle_btn.setFixedWidth(80)
-        self._console_toggle_btn.setStyleSheet(
-            f"QPushButton{{background:{SURFACE};border:1px solid {BORDER};"
-            f"border-radius:3px;color:{TEXT_DIM};font-size:10px;padding:0;}}"
-            f"QPushButton:hover{{color:{TEXT};}}"
-        )
+        self._console_toggle_btn = QPushButton("\u25b6  CONSOLE")
+        self._console_toggle_btn.setFixedHeight(18)
+        self._console_toggle_btn.setToolTip("Show / hide the serial console")
+        self._console_toggle_btn.setStyleSheet(small)
         self._console_toggle_btn.clicked.connect(self._toggle_console)
-        console_header.addWidget(self._console_toggle_btn)
-        console_header_w = QWidget()
-        console_header_w.setLayout(console_header)
-        bl.addWidget(console_header_w)
 
         self.console = ConsoleWidget()
         self.console._copy_btn_ref = copy_btn
@@ -6557,6 +6545,8 @@ class VideomancerApp(QMainWindow):
         sep2.setStyleSheet(f"color:{BORDER};background:transparent;")
         self.status_bar.addPermanentWidget(sep2)
         self.status_bar.addPermanentWidget(self._sb_fw)
+        self.status_bar.addPermanentWidget(self._copy_btn)
+        self.status_bar.addPermanentWidget(self._console_toggle_btn)
         self.status_bar.showMessage("Disconnected")
 
     def _build_header(self):
@@ -6872,10 +6862,10 @@ fi
         self._console_visible = not self._console_visible
         if self._console_visible:
             self.console.show()
-            self._console_toggle_btn.setText("▼  HIDE")
+            self._console_toggle_btn.setText("\u25bc  CONSOLE")
         else:
             self.console.hide()
-            self._console_toggle_btn.setText("▶  SHOW")
+            self._console_toggle_btn.setText("\u25b6  CONSOLE")
 
     def _do_connect(self, port: str):
         if self._worker and self._worker.isRunning():
@@ -6911,8 +6901,6 @@ fi
         self.conn_bar.set_connected(port)
         self.library_tab.set_connected(True)
         self._lib_scan_on_boot = True    # scan the card once the program list is in
-        if self.tabs.currentIndex() == 2:
-            QTimer.singleShot(2000, self._poll_health)
         self.prog_tab.set_connected(True)
         self.param_tab.set_connected(True)
         self.system_tab.set_connected(True)
@@ -7082,14 +7070,6 @@ fi
                 self._fs_reply(json.loads(payload))
             except Exception:
                 self._fs_reply({"raw": payload})
-
-        elif key in ("cpu", "ram", "fpga", "fs"):
-            try:
-                data = json.loads(payload)
-            except Exception:
-                return
-            if isinstance(data, dict):
-                self.system_tab.apply_health(key, data)
 
         elif key == "program":
             if payload == "ok":
@@ -8297,24 +8277,7 @@ fi
                 f"Firmware {self.system_tab._latest_fw} is available — "
                 f"System tab \u2192 Update with LZX Connect", 10000)
 
-    def _poll_health(self):
-        """Every 5 s while the System tab is showing. Skips a tick when it
-        can't poll (not connected, card scan running) instead of stopping —
-        stopping here left Device Health blank until the tab was reopened."""
-        if self.tabs.currentIndex() != 2:
-            self._health_timer.stop()
-            return
-        if not self._health_timer.isActive():
-            self._health_timer.start()
-        if self._worker and not self._library_busy:
-            for cmd in ("cpu", "ram", "fpga status", "fs info"):
-                self._worker.send(cmd)
-
     def _on_tab_changed(self, idx: int):
-        if idx != 2:
-            self._health_timer.stop()
-        else:
-            self._health_timer.start()
         if idx == 4 and not self._worker and not self._lib_releases:
             self._lib_refresh()          # browse the library even when offline
         if not self._worker:
@@ -8326,8 +8289,6 @@ fi
             self._worker.send("video status")
             self._worker.send("modulation cc-map")
             self._worker.send("version")
-            self._poll_health()
-            self._health_timer.start()
         elif idx == 3: # State
             self._fetch_presets()
             self.state_tab._reload_snapshots()
@@ -8365,7 +8326,6 @@ fi
             self._hotplug_timer.stop()
         if hasattr(self, '_uptime_timer'):
             self._uptime_timer.stop()
-        self._health_timer.stop()
         self._load_watchdog.stop()
         self._cmd_flush.stop()
         for t in (getattr(self, '_update_checker', None), getattr(self, '_fw_checker', None)):
